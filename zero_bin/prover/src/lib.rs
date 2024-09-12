@@ -43,6 +43,7 @@ impl BlockProverInput {
         let txs =
             trace_decoder::entrypoint(self.block_trace, self.other_data, |_| unimplemented!())?;
 
+        info!("*** Start agg proof");
         let agg_proof = IndexedStream::from(txs)
             .map(&TxProof {
                 save_inputs_on_error,
@@ -53,6 +54,7 @@ impl BlockProverInput {
             .run(runtime)
             .await?;
 
+        info!("*** Start agg proof 2");
         if let proof_gen::proof_types::AggregatableProof::Agg(proof) = agg_proof {
             let block_number = block_number
                 .to_u64()

@@ -17,7 +17,7 @@ else
     num_procs=$(nproc)
 fi
 
-# Force the working directory to always be the `tools/` directory. 
+# Force the working directory to always be the `tools/` directory.
 TOOLS_DIR=$(dirname $(realpath "$0"))
 
 LEADER_OUT_PATH="${TOOLS_DIR}/leader.out"
@@ -93,7 +93,7 @@ fi
 # proof. This is useful for quickly testing decoding and all of the
 # other non-proving code.
 if [[ $TEST_ONLY == "test_only" ]]; then
-    cargo run --release --features test_only --bin leader -- --runtime in-memory --load-strategy on-demand stdio < $INPUT_FILE &> $TEST_OUT_PATH
+    cargo run --release --features test_only,cuda --bin leader -- --runtime in-memory --load-strategy on-demand stdio < $INPUT_FILE &> $TEST_OUT_PATH
     if grep -q 'All proof witnesses have been generated successfully.' $TEST_OUT_PATH; then
         echo -e "\n\nSuccess - Note this was just a test, not a proof"
         rm $TEST_OUT_PATH

@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
+
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use env_logger::{try_init_from_env, Env, DEFAULT_FILTER_ENV};
 use ethereum_types::{Address, H256, U256};
@@ -31,6 +34,9 @@ use plonky2::field::goldilocks_field::GoldilocksField;
 type F = GoldilocksField;
 
 fn criterion_benchmark(c: &mut Criterion) {
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
+
     let inputs = prepare_setup().unwrap();
 
     // Dummy call to preinitialize the kernel.

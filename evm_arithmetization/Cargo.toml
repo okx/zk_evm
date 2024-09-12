@@ -43,6 +43,7 @@ static_assertions = { workspace = true }
 hashbrown = { workspace = true }
 tiny-keccak = { workspace = true }
 serde_json = { workspace = true }
+cryptography_cuda = { workspace = true }
 
 # Local dependencies
 mpt_trie = { workspace = true }
@@ -62,6 +63,7 @@ parallel = [
   "starky/parallel",
 ]
 polygon_pos = []
+cuda = ["plonky2/cuda", "cryptography_cuda/cuda"]
 
 [[bin]]
 name = "assemble"

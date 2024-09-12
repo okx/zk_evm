@@ -5,6 +5,8 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Command;
 use client::RpcParams;
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
 use dotenvy::dotenv;
 use ops::register;
 use paladin::runtime::Runtime;
@@ -42,6 +44,9 @@ async fn main() -> Result<()> {
     load_dotenvy_vars_if_present();
     set_circuit_cache_dir_env_if_not_set()?;
     init::tracing();
+
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
 
     if env::var_os(EVM_ARITHMETIZATION_PKG_VER).is_none() {
         // Safety:

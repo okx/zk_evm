@@ -1,6 +1,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
+
 use ethereum_types::{Address, BigEndianHash, H256};
 use evm_arithmetization::generation::mpt::{AccountRlp, LegacyReceiptRlp};
 use evm_arithmetization::generation::{GenerationInputs, TrieInputs};
@@ -29,6 +32,9 @@ type C = KeccakGoldilocksConfig;
 #[test]
 fn test_selfdestruct() -> anyhow::Result<()> {
     init_logger();
+
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
     let config = StarkConfig::standard_fast_config();

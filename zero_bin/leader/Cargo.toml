@@ -25,6 +25,8 @@ futures = { workspace = true }
 alloy.workspace = true
 axum = { workspace = true }
 toml = { workspace = true }
+plonky2 = { workspace = true }
+cryptography_cuda = { workspace = true }
 
 # Local dependencies
 ops = { workspace = true }
@@ -35,6 +37,7 @@ zero_bin_common = { workspace = true }
 [features]
 default = []
 test_only = ["ops/test_only", "prover/test_only"]
+cuda = ["plonky2/cuda", "cryptography_cuda/cuda"]
 
 [build-dependencies]
 cargo_metadata = { workspace = true }

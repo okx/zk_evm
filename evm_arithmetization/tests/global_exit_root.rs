@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
+
 use ethereum_types::{H256, U256};
 use evm_arithmetization::generation::{GenerationInputs, TrieInputs};
 use evm_arithmetization::proof::{BlockHashes, BlockMetadata, TrieRoots};
@@ -27,6 +30,9 @@ type C = PoseidonGoldilocksConfig;
 #[test]
 fn test_global_exit_root() -> anyhow::Result<()> {
     init_logger();
+
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
     let config = StarkConfig::standard_fast_config();

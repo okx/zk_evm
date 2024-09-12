@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
+
 use bytes::Bytes;
 use ethereum_types::{Address, BigEndianHash, H256};
 use evm_arithmetization::generation::mpt::transaction_testing::{
@@ -34,6 +37,9 @@ type C = PoseidonGoldilocksConfig;
 #[test]
 fn test_log_opcodes() -> anyhow::Result<()> {
     init_logger();
+
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
     let config = StarkConfig::standard_fast_config();

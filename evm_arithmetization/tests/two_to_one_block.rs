@@ -1,3 +1,6 @@
+#[cfg(feature="cuda")]
+use cryptography_cuda::init_cuda_rs;
+
 use env_logger::{try_init_from_env, Env, DEFAULT_FILTER_ENV};
 use ethereum_types::{Address, BigEndianHash, H256};
 use evm_arithmetization::fixed_recursive_verifier::{
@@ -155,6 +158,10 @@ fn get_test_block_proof(
 #[test]
 fn test_two_to_one_block_aggregation() -> anyhow::Result<()> {
     init_logger();
+
+    #[cfg(feature="cuda")]
+    init_cuda_rs();
+
     let some_timestamps = [127, 42, 65, 43];
 
     let all_stark = AllStark::<F, D>::default();
