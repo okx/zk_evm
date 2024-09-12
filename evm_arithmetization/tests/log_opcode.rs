@@ -35,7 +35,7 @@ type C = PoseidonGoldilocksConfig;
 
 /// Variation of `add11_yml` testing LOG opcodes.
 #[test]
-fn test_log_opcodes() -> anyhow::Result<()> {
+fn test_log_opcode() -> anyhow::Result<()> {
     init_logger();
 
     #[cfg(feature="cuda")]

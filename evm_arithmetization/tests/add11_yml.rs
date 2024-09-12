@@ -31,7 +31,7 @@ type C = KeccakGoldilocksConfig;
 
 /// The `add11_yml` test case from https://github.com/ethereum/tests
 #[test]
-fn add11_yml() -> anyhow::Result<()> {
+fn test_add11_yml() -> anyhow::Result<()> {
     init_logger();
 
     #[cfg(feature="cuda")]
