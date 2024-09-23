@@ -69,7 +69,7 @@ where
 {
     pub is_dummy: bool,
     pub proof_with_pis: ProofWithPublicInputs<F, C, D>,
-    pub public_values: PublicValues,
+    pub public_values: PublicValues<F>,
 }
 
 /// Contains all recursive circuits used in the system. For each STARK and each
@@ -697,77 +697,30 @@ where
         // Sanity check on the provided config
         assert_eq!(DEFAULT_CAP_LEN, 1 << stark_config.fri_config.cap_height);
 
-        let arithmetic = RecursiveCircuitsForTable::new(
-            Table::Arithmetic,
-            &all_stark.arithmetic_stark,
-            degree_bits_ranges[*Table::Arithmetic].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let byte_packing = RecursiveCircuitsForTable::new(
-            Table::BytePacking,
-            &all_stark.byte_packing_stark,
-            degree_bits_ranges[*Table::BytePacking].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let cpu = RecursiveCircuitsForTable::new(
-            Table::Cpu,
-            &all_stark.cpu_stark,
-            degree_bits_ranges[*Table::Cpu].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let keccak = RecursiveCircuitsForTable::new(
-            Table::Keccak,
-            &all_stark.keccak_stark,
-            degree_bits_ranges[*Table::Keccak].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let keccak_sponge = RecursiveCircuitsForTable::new(
-            Table::KeccakSponge,
-            &all_stark.keccak_sponge_stark,
-            degree_bits_ranges[*Table::KeccakSponge].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let logic = RecursiveCircuitsForTable::new(
-            Table::Logic,
-            &all_stark.logic_stark,
-            degree_bits_ranges[*Table::Logic].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let memory = RecursiveCircuitsForTable::new(
-            Table::Memory,
-            &all_stark.memory_stark,
-            degree_bits_ranges[*Table::Memory].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let mem_before = RecursiveCircuitsForTable::new(
-            Table::MemBefore,
-            &all_stark.mem_before_stark,
-            degree_bits_ranges[*Table::MemBefore].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
-        let mem_after = RecursiveCircuitsForTable::new(
-            Table::MemAfter,
-            &all_stark.mem_after_stark,
-            degree_bits_ranges[*Table::MemAfter].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
+        macro_rules! create_recursive_circuit {
+            ($table_enum:expr, $stark_field:ident) => {
+                RecursiveCircuitsForTable::new(
+                    $table_enum,
+                    &all_stark.$stark_field,
+                    degree_bits_ranges[*$table_enum].clone(),
+                    &all_stark.cross_table_lookups,
+                    stark_config,
+                )
+            };
+        }
+
+        let arithmetic = create_recursive_circuit!(Table::Arithmetic, arithmetic_stark);
+        let byte_packing = create_recursive_circuit!(Table::BytePacking, byte_packing_stark);
+        let cpu = create_recursive_circuit!(Table::Cpu, cpu_stark);
+        let keccak = create_recursive_circuit!(Table::Keccak, keccak_stark);
+        let keccak_sponge = create_recursive_circuit!(Table::KeccakSponge, keccak_sponge_stark);
+        let logic = create_recursive_circuit!(Table::Logic, logic_stark);
+        let memory = create_recursive_circuit!(Table::Memory, memory_stark);
+        let mem_before = create_recursive_circuit!(Table::MemBefore, mem_before_stark);
+        let mem_after = create_recursive_circuit!(Table::MemAfter, mem_after_stark);
+
         #[cfg(feature = "cdk_erigon")]
-        let poseidon = RecursiveCircuitsForTable::new(
-            Table::Poseidon,
-            &all_stark.poseidon_stark,
-            degree_bits_ranges[*Table::Poseidon].clone(),
-            &all_stark.cross_table_lookups,
-            stark_config,
-        );
+        let poseidon = create_recursive_circuit!(Table::Poseidon, poseidon_stark);
 
         let by_table = [
             arithmetic,
@@ -782,6 +735,7 @@ where
             #[cfg(feature = "cdk_erigon")]
             poseidon,
         ];
+
         let root = Self::create_segment_circuit(&by_table, stark_config);
         let segment_aggregation = Self::create_segment_aggregation_circuit(&root);
         let txn_aggregation =
@@ -789,6 +743,7 @@ where
         let block = Self::create_block_circuit(&txn_aggregation);
         let block_wrapper = Self::create_block_wrapper_circuit(&block);
         let two_to_one_block = Self::create_two_to_one_block_circuit(&block_wrapper);
+
         Self {
             root,
             segment_aggregation,
@@ -1347,9 +1302,6 @@ where
         let parent_block_proof = builder.add_virtual_proof_with_pis(&expected_common_data);
         let agg_root_proof = builder.add_virtual_proof_with_pis(&agg.circuit.common);
 
-        // Connect block hashes
-        Self::connect_block_hashes(&mut builder, &parent_block_proof, &agg_root_proof);
-
         let parent_pv = PublicValuesTarget::from_public_inputs(&parent_block_proof.public_inputs);
         let agg_pv = PublicValuesTarget::from_public_inputs(&agg_root_proof.public_inputs);
 
@@ -1379,6 +1331,13 @@ where
             &mut builder,
             public_values.extra_block_data,
             agg_pv.extra_block_data,
+        );
+
+        // Check that the paent block's timestamp is less than the current block's.
+        Self::check_block_timestamp(
+            &mut builder,
+            parent_pv.block_metadata.block_timestamp,
+            agg_pv.block_metadata.block_timestamp,
         );
 
         // Connect the burn address targets.
@@ -1423,6 +1382,17 @@ where
         }
     }
 
+    fn check_block_timestamp(
+        builder: &mut CircuitBuilder<F, D>,
+        prev_timestamp: Target,
+        timestamp: Target,
+    ) {
+        // We check that timestamp >= prev_timestamp.
+        // In other words, we range-check `diff = timestamp - prev_timestamp`
+        // is between 0 and 2ˆ32.
+        let diff = builder.sub(timestamp, prev_timestamp);
+        builder.range_check(diff, 32);
+    }
     fn connect_extra_public_values(
         builder: &mut CircuitBuilder<F, D>,
         pvs: &ExtraBlockDataTarget,
@@ -1555,7 +1525,7 @@ where
         // This also enforces that the initial state trie root that will be stored in
         // these `FinalPublicValues` actually matches the known checkpoint state trie
         // root.
-        final_pv.connect_parent(&mut builder, &parent_pv);
+        final_pv.connect_parent::<F, C, D>(&mut builder, &parent_pv);
 
         let block_verifier_data = builder.constant_verifier_data(&block.circuit.verifier_only);
 
@@ -1672,13 +1642,11 @@ where
     /// Connect the 256 block hashes between two blocks
     fn connect_block_hashes(
         builder: &mut CircuitBuilder<F, D>,
-        lhs: &ProofWithPublicInputsTarget<D>,
-        rhs: &ProofWithPublicInputsTarget<D>,
+        lhs_public_values: &PublicValuesTarget,
+        rhs_public_values: &PublicValuesTarget,
     ) {
-        let lhs_public_values = PublicValuesTarget::from_public_inputs(&lhs.public_inputs);
-        let rhs_public_values = PublicValuesTarget::from_public_inputs(&rhs.public_inputs);
         for i in 0..255 {
-            for j in 0..8 {
+            for j in 0..TARGET_HASH_SIZE {
                 builder.connect(
                     lhs_public_values.block_hashes.prev_hashes[8 * (i + 1) + j],
                     rhs_public_values.block_hashes.prev_hashes[8 * i + j],
@@ -1687,7 +1655,7 @@ where
         }
         let expected_hash = lhs_public_values.block_hashes.cur_hash;
         let prev_block_hash = &rhs_public_values.block_hashes.prev_hashes[255 * 8..256 * 8];
-        for i in 0..expected_hash.len() {
+        for i in 0..TARGET_HASH_SIZE {
             builder.connect(expected_hash[i], prev_block_hash[i]);
         }
     }
@@ -1736,6 +1704,9 @@ where
         // Check that the checkpoint block has the predetermined state trie root in
         // `ExtraBlockData`.
         Self::connect_checkpoint_block(builder, rhs, has_not_parent_block);
+
+        // Connect block hashes
+        Self::connect_block_hashes(builder, lhs, rhs);
     }
 
     fn connect_checkpoint_block(
@@ -1754,6 +1725,18 @@ where
             let mut constr = builder.sub(limb0, limb1);
             constr = builder.mul(has_not_parent_block, constr);
             builder.assert_zero(constr);
+        }
+
+        let consolidated_hash = builder
+            .hash_n_to_hash_no_pad::<C::InnerHasher>(x.block_hashes.prev_hashes.to_vec())
+            .elements;
+
+        for i in 0..NUM_HASH_OUT_ELTS {
+            builder.conditional_assert_eq(
+                has_not_parent_block,
+                x.extra_block_data.checkpoint_consolidated_hash[i],
+                consolidated_hash[i],
+            )
         }
     }
 
@@ -1818,7 +1801,7 @@ where
         &self,
         all_stark: &AllStark<F, D>,
         config: &StarkConfig,
-        generation_inputs: TrimmedGenerationInputs,
+        generation_inputs: TrimmedGenerationInputs<F>,
         segment_data: &mut GenerationSegmentData,
         timing: &mut TimingTree,
         abort_signal: Option<Arc<AtomicBool>>,
@@ -1893,7 +1876,7 @@ where
         &self,
         all_stark: &AllStark<F, D>,
         config: &StarkConfig,
-        generation_inputs: GenerationInputs,
+        generation_inputs: GenerationInputs<F>,
         max_cpu_len_log: usize,
         timing: &mut TimingTree,
         abort_signal: Option<Arc<AtomicBool>>,
@@ -1985,7 +1968,7 @@ where
         all_proof: AllProof<F, C, D>,
         table_circuits: &[(RecursiveCircuitsForTableSize<F, C, D>, u8); NUM_TABLES],
         abort_signal: Option<Arc<AtomicBool>>,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues)> {
+    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues<F>)> {
         let mut root_inputs = PartialWitness::new();
 
         for table in 0..NUM_TABLES {
@@ -2106,6 +2089,9 @@ where
                 checkpoint_state_trie_root: lhs_public_values
                     .extra_block_data
                     .checkpoint_state_trie_root,
+                checkpoint_consolidated_hash: lhs_public_values
+                    .extra_block_data
+                    .checkpoint_consolidated_hash,
                 txn_number_before: lhs_public_values.extra_block_data.txn_number_before,
                 txn_number_after: real_public_values.extra_block_data.txn_number_after,
                 gas_used_before: lhs_public_values.extra_block_data.gas_used_before,
@@ -2175,11 +2161,11 @@ where
         &self,
         lhs_is_agg: bool,
         lhs_proof: &ProofWithPublicInputs<F, C, D>,
-        lhs_public_values: PublicValues,
+        lhs_public_values: PublicValues<F>,
         rhs_is_agg: bool,
         rhs_proof: &ProofWithPublicInputs<F, C, D>,
-        rhs_public_values: PublicValues,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues)> {
+        rhs_public_values: PublicValues<F>,
+    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues<F>)> {
         let mut txn_inputs = PartialWitness::new();
 
         Self::set_dummy_if_necessary(
@@ -2290,8 +2276,8 @@ where
         &self,
         opt_parent_block_proof: Option<&ProofWithPublicInputs<F, C, D>>,
         agg_root_proof: &ProofWithPublicInputs<F, C, D>,
-        public_values: PublicValues,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues)> {
+        public_values: PublicValues<F>,
+    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues<F>)> {
         let mut block_inputs = PartialWitness::new();
 
         block_inputs.set_bool_target(
@@ -2387,14 +2373,14 @@ where
                         + TrieRootsTarget::SIZE * 2
                         + BlockMetadataTarget::SIZE
                         + BlockHashesTarget::SIZE
-                        - 8;
-
+                        - 16;
             for i in 0..public_values.block_hashes.prev_hashes.len() - 1 {
                 let targets = h256_limbs::<F>(public_values.block_hashes.prev_hashes[i]);
                 for j in 0..8 {
                     nonzero_pis.insert(block_hashes_keys.start + 8 * (i + 1) + j, targets[j]);
                 }
             }
+
             let block_hashes_current_start = burn_addr_offset
                 + TrieRootsTarget::SIZE * 2
                 + BlockMetadataTarget::SIZE
@@ -2474,11 +2460,15 @@ where
     /// This method outputs a tuple of [`ProofWithPublicInputs<F, C, D>`] and
     /// associated [`FinalPublicValues`]. Only the proof with public inputs is
     /// necessary for a verifier to assert correctness of the computation.
+    #[allow(clippy::type_complexity)]
     pub fn prove_block_wrapper(
         &self,
         block_proof: &ProofWithPublicInputs<F, C, D>,
-        public_values: PublicValues,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, FinalPublicValues)> {
+        public_values: PublicValues<F>,
+    ) -> anyhow::Result<(
+        ProofWithPublicInputs<F, C, D>,
+        FinalPublicValues<F, C::InnerHasher>,
+    )> {
         let mut block_wrapper_inputs = PartialWitness::new();
 
         block_wrapper_inputs

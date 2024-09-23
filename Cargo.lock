@@ -757,7 +757,7 @@ dependencies = [
  "assert2-macros",
  "diff",
  "is-terminal",
- "yansi",
+ "yansi 1.0.1",
 ]
 
 [[package]]
@@ -1296,6 +1296,8 @@ version = "1.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b62ac837cdb5cb22e10a256099b4fc502b1dfe560cb282963a974d7abd80e476"
 dependencies = [
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1349,17 +1351,6 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
-]
-
-[[package]]
-name = "clang-sys"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
-dependencies = [
- "glob",
- "libc",
- "libloading",
 ]
 
 [[package]]
@@ -2492,6 +2483,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32085ea23f3234fc7846555e85283ba4de91e21016dc0455a16286d87a292d64"
 
 [[package]]
+name = "git2"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b903b73e45dc0c6c596f2d37eccece7c1c8bb6e4407b001096387c63d0d93724"
+dependencies = [
+ "bitflags 2.6.0",
+ "libc",
+ "libgit2-sys",
+ "log",
+ "url",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2912,6 +2916,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48d1dbcbbeb6a7fec7e059840aa538bd62aaccf972c7346c4d9d2059312853d0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.70"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2992,53 +3005,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
-name = "lazycell"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
-
-[[package]]
-name = "leader"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "axum",
- "cargo_metadata",
- "clap",
- "cryptography_cuda",
- "evm_arithmetization",
- "futures",
- "ops",
- "paladin-core",
- "plonky2",
- "proof_gen",
- "prover",
- "rpc",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vergen",
- "zero_bin_common",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.158"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8adc4bb1803a324070e64a98ae98f38934d91957a99cfb3a43dcbc01bc56439"
 
 [[package]]
-name = "libloading"
-version = "0.8.5"
+name = "libgit2-sys"
+version = "0.17.0+1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
+checksum = "10472326a8a6477c3c20a64547b0059e4b0d086869eee31e6d7da728a8eb7224"
 dependencies = [
- "cfg-if",
- "windows-targets 0.52.6",
+ "cc",
+ "libc",
+ "libz-sys",
+ "pkg-config",
 ]
 
 [[package]]
@@ -3067,6 +3048,18 @@ dependencies = [
  "escape8259",
  "termcolor",
  "threadpool",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2d16453e800a8cf6dd2fc3eb4bc99b786a9b90c663b8559a5b1a041bf89e472"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -3448,19 +3441,6 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "ops"
-version = "0.1.0"
-dependencies = [
- "evm_arithmetization",
- "keccak-hash 0.10.0",
- "paladin-core",
- "proof_gen",
- "serde",
- "tracing",
- "zero_bin_common",
 ]
 
 [[package]]
@@ -3918,6 +3898,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pretty_assertions"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af7cee1a6c8a5b9208b3cb1061f10c0cb689087b3d8ce85fb9d2dd7a29b6ba66"
+dependencies = [
+ "diff",
+ "yansi 0.5.1",
+]
+
+[[package]]
 name = "pretty_env_logger"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4010,6 +4000,7 @@ dependencies = [
  "paste",
  "plonky2",
  "serde",
+ "zk_evm_common",
 ]
 
 [[package]]
@@ -4030,30 +4021,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "prover"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "clap",
- "evm_arithmetization",
- "futures",
- "num-traits",
- "ops",
- "paladin-core",
- "plonky2",
- "plonky2_maybe_rayon",
- "proof_gen",
- "ruint",
- "serde",
- "serde_json",
- "tokio",
- "trace_decoder",
- "tracing",
- "zero_bin_common",
 ]
 
 [[package]]
@@ -4312,34 +4279,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "rpc"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "cargo_metadata",
- "clap",
- "compat",
- "evm_arithmetization",
- "futures",
- "hex",
- "itertools 0.13.0",
- "mpt_trie",
- "primitive-types 0.12.2",
- "prover",
- "serde",
- "serde_json",
- "tokio",
- "tower 0.4.13",
- "trace_decoder",
- "tracing",
- "tracing-subscriber",
- "url",
- "vergen",
- "zero_bin_common",
 ]
 
 [[package]]
@@ -5327,6 +5266,7 @@ dependencies = [
  "camino",
  "ciborium",
  "ciborium-io",
+ "clap",
  "copyvec",
  "criterion",
  "either",
@@ -5343,8 +5283,9 @@ dependencies = [
  "mpt_trie",
  "nunny",
  "plonky2",
- "plonky2_maybe_rayon",
- "prover",
+ "plonky2_maybe_rayon 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pretty_assertions",
+ "pretty_env_logger",
  "rlp",
  "serde",
  "serde_json",
@@ -5355,6 +5296,7 @@ dependencies = [
  "thiserror",
  "u4",
  "winnow",
+ "zero",
  "zk_evm_common",
 ]
 
@@ -5571,9 +5513,23 @@ checksum = "c32e7318e93a9ac53693b6caccfb05ff22e04a44c7cf8a279051f24c09da286f"
 dependencies = [
  "anyhow",
  "derive_builder",
- "rustc_version 0.4.1",
  "rustversion",
  "time",
+ "vergen-lib",
+]
+
+[[package]]
+name = "vergen-git2"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a62c52cd2b2b8b7ec75fc20111b3022ac3ff83e4fc14b9497cfcfd39c54f9c67"
+dependencies = [
+ "anyhow",
+ "derive_builder",
+ "git2",
+ "rustversion",
+ "time",
+ "vergen",
  "vergen-lib",
 ]
 
@@ -5587,23 +5543,6 @@ dependencies = [
  "derive_builder",
  "getset",
  "rustversion",
-]
-
-[[package]]
-name = "verifier"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cargo_metadata",
- "clap",
- "dotenvy",
- "proof_gen",
- "serde_json",
- "serde_path_to_error",
- "tracing",
- "tracing-subscriber",
- "vergen",
- "zero_bin_common",
 ]
 
 [[package]]
@@ -5970,23 +5909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "worker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cargo_metadata",
- "clap",
- "dotenvy",
- "jemallocator",
- "ops",
- "paladin-core",
- "tokio",
- "tracing-subscriber",
- "vergen",
- "zero_bin_common",
-]
-
-[[package]]
 name = "wyz"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6025,35 +5947,59 @@ dependencies = [
 
 [[package]]
 name = "yansi"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09041cd90cf85f7f8b2df60c646f853b7f535ce68f85244eb6731cf89fa498ec"
+
+[[package]]
+name = "yansi"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
-name = "zero_bin_common"
+name = "zero"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-compat",
  "anyhow",
  "async-stream",
+ "axum",
  "cargo_metadata",
  "clap",
+ "compat",
  "directories",
  "dotenvy",
  "evm_arithmetization",
  "futures",
+ "hex",
+ "itertools 0.13.0",
+ "jemallocator",
+ "keccak-hash 0.10.0",
  "lru",
+ "mpt_trie",
+ "num-traits",
  "once_cell",
+ "paladin-core",
  "plonky2",
+ "plonky2_maybe_rayon 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "primitive-types 0.12.2",
  "proof_gen",
+ "ruint",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "thiserror",
  "tokio",
+ "toml",
+ "tower 0.4.13",
+ "trace_decoder",
  "tracing",
  "tracing-subscriber",
- "vergen",
+ "url",
+ "vergen-git2",
+ "zk_evm_common",
 ]
 
 [[package]]
