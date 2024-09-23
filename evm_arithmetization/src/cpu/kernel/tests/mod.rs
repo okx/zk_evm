@@ -1,16 +1,20 @@
 mod account_code;
+#[cfg(feature = "eth_mainnet")]
 mod add11;
 mod balance;
 mod bignum;
 mod blake2_f;
+#[cfg(feature = "eth_mainnet")]
 mod blobhash;
 mod block_hash;
+#[cfg(feature = "eth_mainnet")]
 mod bls381;
 mod bn254;
 mod core;
 mod ecc;
 mod exp;
 mod hash;
+mod init_exc_stop;
 mod kernel_consistency;
 mod log;
 mod mcopy;
@@ -30,7 +34,7 @@ use std::{
 
 use anyhow::Result;
 use ethereum_types::U256;
-use plonky2::field::types::Field;
+use plonky2::hash::hash_types::RichField;
 
 use super::{
     aggregator::KERNEL,
@@ -55,11 +59,11 @@ pub(crate) fn u256ify<'a>(hexes: impl IntoIterator<Item = &'a str>) -> Result<Ve
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-pub(crate) fn run_interpreter<F: Field>(
+pub(crate) fn run_interpreter<F: RichField>(
     initial_offset: usize,
     initial_stack: Vec<U256>,
 ) -> anyhow::Result<Interpreter<F>> {
-    let mut interpreter = Interpreter::new(initial_offset, initial_stack);
+    let mut interpreter = Interpreter::new(initial_offset, initial_stack, None);
     interpreter.run()?;
     Ok(interpreter)
 }
@@ -72,13 +76,13 @@ pub(crate) struct InterpreterMemoryInitialization {
     pub memory: Vec<(usize, Vec<U256>)>,
 }
 
-pub(crate) fn run_interpreter_with_memory<F: Field>(
+pub(crate) fn run_interpreter_with_memory<F: RichField>(
     memory_init: InterpreterMemoryInitialization,
 ) -> anyhow::Result<Interpreter<F>> {
     let label = KERNEL.global_labels[&memory_init.label];
     let mut stack = memory_init.stack;
     stack.reverse();
-    let mut interpreter = Interpreter::new(label, stack);
+    let mut interpreter = Interpreter::new(label, stack, None);
     for (pointer, data) in memory_init.memory {
         for (i, term) in data.iter().enumerate() {
             interpreter.generation_state.memory.set(
@@ -91,7 +95,7 @@ pub(crate) fn run_interpreter_with_memory<F: Field>(
     Ok(interpreter)
 }
 
-impl<F: Field> Interpreter<F> {
+impl<F: RichField> Interpreter<F> {
     pub(crate) fn get_txn_field(&self, field: NormalizedTxnField) -> U256 {
         // These fields are already scaled by their respective segment.
         self.generation_state.memory.contexts[0].segments[Segment::TxnFields.unscale()]

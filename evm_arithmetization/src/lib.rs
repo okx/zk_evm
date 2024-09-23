@@ -183,6 +183,17 @@
 #![allow(clippy::field_reassign_with_default)]
 #![feature(let_chains)]
 
+#[cfg_attr(
+    not(any(feature = "polygon_pos", feature = "cdk_erigon")),
+    cfg(feature = "eth_mainnet")
+)]
+#[cfg(any(
+    all(feature = "cdk_erigon", feature = "polygon_pos"),
+    all(feature = "cdk_erigon", feature = "eth_mainnet"),
+    all(feature = "polygon_pos", feature = "eth_mainnet"),
+))]
+compile_error!("Only a single network feature should be enabled at a time!");
+
 // Individual STARK processing units
 pub mod arithmetic;
 pub mod byte_packing;
@@ -191,6 +202,9 @@ pub mod keccak;
 pub mod keccak_sponge;
 pub mod logic;
 pub mod memory;
+pub mod memory_continuation;
+#[cfg(feature = "cdk_erigon")]
+pub mod poseidon;
 
 // Proving system components
 pub mod all_stark;
@@ -211,6 +225,8 @@ pub mod extension_tower;
 pub mod testing_utils;
 pub mod util;
 
+use generation::segments::SegmentError;
+use generation::TrimmedGenerationInputs;
 use mpt_trie::partial_trie::HashedPartialTrie;
 
 // Public definitions and re-exports
@@ -219,7 +235,12 @@ pub type Node = mpt_trie::partial_trie::Node<HashedPartialTrie>;
 /// A type alias for `u64` of a block height.
 pub type BlockHeight = u64;
 
-pub use all_stark::AllStark;
+pub use all_stark::{AllStark, NUM_TABLES};
 pub use fixed_recursive_verifier::AllRecursiveCircuits;
+pub use generation::segments::{GenerationSegmentData, SegmentDataIterator};
 pub use generation::GenerationInputs;
 pub use starky::config::StarkConfig;
+
+/// Returned type from a `SegmentDataIterator`, needed to prove all segments in
+/// a transaction batch.
+pub type AllData = Result<(TrimmedGenerationInputs, GenerationSegmentData), SegmentError>;

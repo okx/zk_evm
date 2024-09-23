@@ -4,6 +4,7 @@ use mpt_trie::partial_trie::PartialTrie;
 use plonky2::field::goldilocks_field::GoldilocksField as F;
 
 use crate::cpu::kernel::aggregator::KERNEL;
+use crate::cpu::kernel::constants::INITIAL_RLP_ADDR;
 use crate::cpu::kernel::interpreter::Interpreter;
 use crate::cpu::kernel::tests::account_code::initialize_mpts;
 use crate::cpu::kernel::tests::mpt::{extension_to_leaf, test_account_1_rlp, test_account_2_rlp};
@@ -112,12 +113,12 @@ fn test_state_trie(trie_inputs: TrieInputs) -> Result<()> {
     let mpt_hash_state_trie = KERNEL.global_labels["mpt_hash_state_trie"];
 
     let initial_stack = vec![];
-    let mut interpreter: Interpreter<F> = Interpreter::new(0, initial_stack);
+    let mut interpreter: Interpreter<F> = Interpreter::new(0, initial_stack, None);
 
     initialize_mpts(&mut interpreter, &trie_inputs);
     assert_eq!(interpreter.stack(), vec![]);
 
-    // Now, execute mpt_hash_state_trie.
+    // Now, execute `mpt_hash_state_trie`.
     interpreter.generation_state.registers.program_counter = mpt_hash_state_trie;
     interpreter
         .push(0xDEADBEEFu32.into())
@@ -125,6 +126,9 @@ fn test_state_trie(trie_inputs: TrieInputs) -> Result<()> {
     interpreter
         .push(1.into()) // Initial length of the trie data segment, unused.
         .expect("The stack should not overflow");
+    interpreter
+        .push(INITIAL_RLP_ADDR.1.into()) // rlp_start
+        .expect("The stack should not overflow.");
     interpreter.run()?;
 
     assert_eq!(

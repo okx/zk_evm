@@ -1,12 +1,15 @@
-use std::env;
 use std::{
     fmt::{Debug, Display},
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use alloy::hex;
+use anyhow::anyhow;
 use directories::ProjectDirs;
+use evm_arithmetization::cpu::kernel::aggregator::KERNEL;
+use once_cell::sync::Lazy;
 use plonky2::util::serialization::{
     Buffer, DefaultGateSerializer, DefaultGeneratorSerializer, IoError,
 };
@@ -22,6 +25,18 @@ const PROVER_STATE_FILE_PREFIX: &str = "prover_state";
 const VERIFIER_STATE_FILE_PREFIX: &str = "verifier_state";
 const ZK_EVM_CACHE_DIR_NAME: &str = "zk_evm_circuit_cache";
 const ZK_EVM_CACHE_DIR_ENV: &str = "ZK_EVM_CACHE_DIR";
+
+/// We version serialized circuits by the kernel hash they were serialized with,
+/// but we really only need a few of the starting hex nibbles to reliably
+/// differentiate.
+const KERNEL_HASH_PREFIX: usize = 8;
+
+/// When we serialize/deserialize circuits, we rely on the hash of the plonky
+/// kernel to determine if the circuit is compatible with our current binary. If
+/// the kernel hash of the circuit that we are loading in from disk differs,
+/// then using these circuits would cause failures during proof generation
+pub static CIRCUIT_VERSION: Lazy<String> =
+    Lazy::new(|| hex::encode(KERNEL.hash())[..KERNEL_HASH_PREFIX].to_string());
 
 fn get_serializers() -> (
     DefaultGateSerializer,
@@ -80,8 +95,8 @@ pub(crate) trait DiskResource {
         if std::fs::metadata(&circuits_dir).is_err() {
             std::fs::create_dir_all(&circuits_dir).map_err(|err| {
                 DiskResourceError::IoError::<Self::Error>(std::io::Error::other(format!(
-                    "Could not create circuits folder with error \"{:?}\"",
-                    err
+                    "Could not create circuits folder at {} (err: {})",
+                    err, circuits_dir
                 )))
             })?;
         }
@@ -111,7 +126,7 @@ impl DiskResource for BaseProverResource {
             "{}/{}_base_{}_{}",
             circuit_dir(),
             PROVER_STATE_FILE_PREFIX,
-            env!("EVM_ARITHMETIZATION_PKG_VER"),
+            *CIRCUIT_VERSION,
             p.get_configuration_digest()
         )
     }
@@ -147,7 +162,7 @@ impl DiskResource for MonolithicProverResource {
             "{}/{}_monolithic_{}_{}",
             circuit_dir(),
             PROVER_STATE_FILE_PREFIX,
-            env!("EVM_ARITHMETIZATION_PKG_VER"),
+            *CIRCUIT_VERSION,
             p.get_configuration_digest()
         )
     }
@@ -182,7 +197,7 @@ impl DiskResource for RecursiveCircuitResource {
             "{}/{}_{}_{}_{}",
             circuit_dir(),
             PROVER_STATE_FILE_PREFIX,
-            env!("EVM_ARITHMETIZATION_PKG_VER"),
+            *CIRCUIT_VERSION,
             circuit_type.as_short_str(),
             size
         )
@@ -226,7 +241,7 @@ impl DiskResource for VerifierResource {
             "{}/{}_{}_{}",
             circuit_dir(),
             VERIFIER_STATE_FILE_PREFIX,
-            env!("EVM_ARITHMETIZATION_PKG_VER"),
+            *CIRCUIT_VERSION,
             p.get_configuration_digest()
         )
     }
@@ -252,6 +267,36 @@ pub fn persist_all_to_disk(
 ) -> anyhow::Result<()> {
     prover_to_disk(circuit_config, circuits)?;
     VerifierResource::put(circuit_config, &circuits.final_verifier_data())?;
+
+    Ok(())
+}
+
+/// Flushes all existing prover state configurations and associated circuits
+/// that have been written to disk.
+pub fn delete_all() -> anyhow::Result<()> {
+    let circuit_dir = circuit_dir();
+    let path = Path::new(&circuit_dir);
+
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_path = entry.path();
+
+            if file_path.is_file()
+                && (entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("prover_state")
+                    || entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("verifier_state"))
+            {
+                // Delete all circuit files.
+                fs::remove_file(file_path)?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -293,14 +338,25 @@ fn circuit_dir() -> String {
 /// variable. If the user does not set this, then we set it base to the OS's
 /// standard location for the cache directory.
 pub fn set_circuit_cache_dir_env_if_not_set() -> anyhow::Result<()> {
-    if std::env::var_os(ZK_EVM_CACHE_DIR_ENV).is_none() {
-        let circuit_cache_dir = match ProjectDirs::from("", "", ZK_EVM_CACHE_DIR_NAME) {
+    let circuit_cache_dir = if let Some(path_str) = std::env::var_os(ZK_EVM_CACHE_DIR_ENV) {
+        PathBuf::from(&path_str)
+    } else {
+        match ProjectDirs::from("", "", ZK_EVM_CACHE_DIR_NAME) {
             Some(proj_dir) => proj_dir.cache_dir().to_path_buf(),
             None => std::env::current_dir()?,
-        };
+        }
+    };
 
-        std::env::set_var(ZK_EVM_CACHE_DIR_ENV, circuit_cache_dir);
+    // Sanity check on naming convention for the circuit cache directory.
+    if let Some(path_str) = Path::new(&circuit_cache_dir).to_str() {
+        if !path_str.ends_with("_circuit_cache") {
+            return Err(anyhow!(
+            "zkEVM circuit cache directory {:?} does not follow convention of ending with \"_circuit_cache\".", path_str
+        ));
+        }
     }
+
+    std::env::set_var(ZK_EVM_CACHE_DIR_ENV, circuit_cache_dir);
 
     Ok(())
 }

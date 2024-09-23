@@ -1,24 +1,48 @@
-use std::future::Future;
-use std::path::PathBuf;
+pub mod cli;
 
-use alloy::primitives::{BlockNumber, U256};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use alloy::primitives::U256;
 use anyhow::{Context, Result};
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryFutureExt, TryStreamExt};
+use futures::{future::BoxFuture, FutureExt, TryFutureExt, TryStreamExt};
 use num_traits::ToPrimitive as _;
-use ops::TxProof;
-use paladin::{
-    directive::{Directive, IndexedStream},
-    runtime::Runtime,
-};
+use paladin::runtime::Runtime;
 use proof_gen::proof_types::GeneratedBlockProof;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::{oneshot, Semaphore};
 use trace_decoder::{BlockTrace, OtherBlockData};
-use tracing::info;
+use tracing::{error, info};
 use zero_bin_common::fs::generate_block_proof_file_name;
 
-#[derive(Debug, Deserialize, Serialize)]
+// All proving tasks are executed concurrently, which can cause issues for large
+// block intervals, where distant future blocks may be proven first.
+//
+// We then create a pool to limit the number of parallel proving block
+// tasks, retrieving new blocks in increasing order when some block proofs are
+// complete.
+//
+// While proving a block interval, we will output proofs corresponding to block
+// batches as soon as they are generated.
+const PARALLEL_BLOCK_PROVING_PERMIT_POOL_SIZE: usize = 16;
+static PARALLEL_BLOCK_PROVING_PERMIT_POOL: Semaphore =
+    Semaphore::const_new(PARALLEL_BLOCK_PROVING_PERMIT_POOL_SIZE);
+
+#[derive(Debug, Clone)]
+pub struct ProverConfig {
+    pub batch_size: usize,
+    pub max_cpu_len_log: usize,
+    pub save_inputs_on_error: bool,
+    pub test_only: bool,
+    pub proof_output_dir: PathBuf,
+    pub keep_intermediate_proofs: bool,
+    pub block_batch_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BlockProverInput {
     pub block_trace: BlockTrace,
     pub other_data: OtherBlockData,
@@ -29,33 +53,76 @@ impl BlockProverInput {
         self.other_data.b_data.b_meta.block_number.into()
     }
 
-    #[cfg(not(feature = "test_only"))]
     pub async fn prove(
         self,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         previous: Option<impl Future<Output = Result<GeneratedBlockProof>>>,
-        save_inputs_on_error: bool,
+        prover_config: Arc<ProverConfig>,
     ) -> Result<GeneratedBlockProof> {
         use anyhow::Context as _;
+        use evm_arithmetization::SegmentDataIterator;
+        use futures::{stream::FuturesUnordered, FutureExt};
+        use paladin::directive::{Directive, IndexedStream};
+
+        let ProverConfig {
+            max_cpu_len_log,
+            batch_size,
+            save_inputs_on_error,
+            ..
+        } = *prover_config;
 
         let block_number = self.get_block_number();
 
-        let txs =
-            trace_decoder::entrypoint(self.block_trace, self.other_data, |_| unimplemented!())?;
+        let use_burn_addr = cfg!(feature = "cdk_erigon");
+        let block_generation_inputs = trace_decoder::entrypoint(
+            self.block_trace,
+            self.other_data,
+            batch_size,
+            use_burn_addr,
+        )?;
 
-        info!("*** Start agg proof");
-        let agg_proof = IndexedStream::from(txs)
-            .map(&TxProof {
-                save_inputs_on_error,
-            })
-            .fold(&ops::AggProof {
-                save_inputs_on_error,
-            })
-            .run(runtime)
-            .await?;
+        // Create segment proof.
+        let seg_prove_ops = ops::SegmentProof {
+            save_inputs_on_error,
+        };
 
-        info!("*** Start agg proof 2");
-        if let proof_gen::proof_types::AggregatableProof::Agg(proof) = agg_proof {
+        // Aggregate multiple segment proofs to resulting segment proof.
+        let seg_agg_ops = ops::SegmentAggProof {
+            save_inputs_on_error,
+        };
+
+        // Aggregate batch proofs to a single proof.
+        let batch_agg_ops = ops::BatchAggProof {
+            save_inputs_on_error,
+        };
+
+        // Segment the batches, prove segments and aggregate them to resulting batch
+        // proofs.
+        let batch_proof_futs: FuturesUnordered<_> = block_generation_inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, txn_batch)| {
+                let segment_data_iterator = SegmentDataIterator::<proof_gen::types::Field>::new(
+                    txn_batch,
+                    Some(max_cpu_len_log),
+                );
+
+                Directive::map(IndexedStream::from(segment_data_iterator), &seg_prove_ops)
+                    .fold(&seg_agg_ops)
+                    .run(&runtime)
+                    .map(move |e| {
+                        e.map(|p| (idx, proof_gen::proof_types::BatchAggregatableProof::from(p)))
+                    })
+            })
+            .collect();
+
+        // Fold the batch aggregated proof stream into a single proof.
+        let final_batch_proof =
+            Directive::fold(IndexedStream::new(batch_proof_futs), &batch_agg_ops)
+                .run(&runtime)
+                .await?;
+
+        if let proof_gen::proof_types::BatchAggregatableProof::Agg(proof) = final_batch_proof {
             let block_number = block_number
                 .to_u64()
                 .context("block number overflows u64")?;
@@ -69,37 +136,66 @@ impl BlockProverInput {
                     prev,
                     save_inputs_on_error,
                 })
-                .run(runtime)
+                .run(&runtime)
                 .await?;
 
             info!("Successfully proved block {block_number}");
+
             Ok(block_proof.0)
         } else {
             anyhow::bail!("AggProof is is not GeneratedAggProof")
         }
     }
 
-    #[cfg(feature = "test_only")]
-    pub async fn prove(
+    pub async fn prove_test(
         self,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         previous: Option<impl Future<Output = Result<GeneratedBlockProof>>>,
-        save_inputs_on_error: bool,
+        prover_config: Arc<ProverConfig>,
     ) -> Result<GeneratedBlockProof> {
+        use std::iter::repeat;
+
+        use futures::future;
+        use paladin::directive::{Directive, IndexedStream};
+
+        let ProverConfig {
+            max_cpu_len_log,
+            batch_size,
+            save_inputs_on_error,
+            ..
+        } = *prover_config;
+
         let block_number = self.get_block_number();
         info!("Testing witness generation for block {block_number}.");
 
-        let txs =
-            trace_decoder::entrypoint(self.block_trace, self.other_data, |_| unimplemented!())?;
+        let use_burn_addr = cfg!(feature = "cdk_erigon");
+        let block_generation_inputs = trace_decoder::entrypoint(
+            self.block_trace,
+            self.other_data,
+            batch_size,
+            use_burn_addr,
+        )?;
 
-        IndexedStream::from(txs)
-            .map(&TxProof {
-                save_inputs_on_error,
-            })
-            .run(runtime)
+        let seg_ops = ops::SegmentProofTestOnly {
+            save_inputs_on_error,
+        };
+
+        let simulation = Directive::map(
+            IndexedStream::from(
+                block_generation_inputs
+                    .into_iter()
+                    .zip(repeat(max_cpu_len_log)),
+            ),
+            &seg_ops,
+        );
+
+        simulation
+            .run(&runtime)
             .await?
-            .try_collect::<Vec<_>>()
+            .try_for_each(|_| future::ok(()))
             .await?;
+
+        info!("Successfully generated witness for block {block_number}.");
 
         // Wait for previous block proof
         let _prev = match previous {
@@ -117,91 +213,135 @@ impl BlockProverInput {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ProverInput {
-    pub blocks: Vec<BlockProverInput>,
+async fn prove_block(
+    block: BlockProverInput,
+    runtime: Arc<Runtime>,
+    previous_block_proof: Option<BoxFuture<'_, Result<GeneratedBlockProof>>>,
+    prover_config: Arc<ProverConfig>,
+) -> Result<GeneratedBlockProof> {
+    if prover_config.test_only {
+        block
+            .prove_test(runtime, previous_block_proof, prover_config)
+            .await
+    } else {
+        block
+            .prove(runtime, previous_block_proof, prover_config)
+            .await
+    }
 }
 
-impl ProverInput {
-    /// Prove all the blocks in the input.
-    /// Return the list of block numbers that are proved and if the proof data
-    /// is not saved to disk, return the generated block proofs as well.
-    pub async fn prove(
-        self,
-        runtime: &Runtime,
-        previous_proof: Option<GeneratedBlockProof>,
-        save_inputs_on_error: bool,
-        proof_output_dir: Option<PathBuf>,
-    ) -> Result<Vec<(BlockNumber, Option<GeneratedBlockProof>)>> {
-        let mut prev: Option<BoxFuture<Result<GeneratedBlockProof>>> =
-            previous_proof.map(|proof| Box::pin(futures::future::ok(proof)) as BoxFuture<_>);
+/// Prove all the blocks in the input, or simulate their execution depending on
+/// the selected prover configuration. Return the list of block numbers that are
+/// proved and if the proof data is not saved to disk, return the generated
+/// block proofs as well.
+pub async fn prove(
+    mut block_receiver: Receiver<(BlockProverInput, bool)>,
+    runtime: Arc<Runtime>,
+    checkpoint_proof: Option<GeneratedBlockProof>,
+    prover_config: Arc<ProverConfig>,
+) -> Result<()> {
+    use tokio::task::JoinSet;
+    let mut block_counter: u64 = 0;
+    let mut prev_proof: Option<BoxFuture<Result<GeneratedBlockProof>>> =
+        checkpoint_proof.map(|proof| Box::pin(futures::future::ok(proof)) as BoxFuture<_>);
 
-        let results: FuturesOrdered<_> = self
-            .blocks
-            .into_iter()
-            .map(|block| {
-                let block_number = block.get_block_number();
-                info!("Proving block {block_number}");
+    let mut task_set: JoinSet<
+        std::result::Result<std::result::Result<u64, anyhow::Error>, anyhow::Error>,
+    > = JoinSet::new();
+    while let Some((block_prover_input, is_last_block)) = block_receiver.recv().await {
+        block_counter += 1;
+        let (tx, rx) = oneshot::channel::<GeneratedBlockProof>();
+        let prover_config = prover_config.clone();
+        let previous_block_proof = prev_proof.take();
+        let runtime = runtime.clone();
+        let block_number = block_prover_input.get_block_number();
 
-                let (tx, rx) = oneshot::channel::<GeneratedBlockProof>();
+        let prove_permit = PARALLEL_BLOCK_PROVING_PERMIT_POOL.acquire().await?;
 
-                // Prove the block
-                let proof_output_dir = proof_output_dir.clone();
-                let fut = block
-                    .prove(runtime, prev.take(), save_inputs_on_error)
-                    .then(move |proof| async move {
-                        let proof = proof?;
-                        let block_number = proof.b_height;
+        let _abort_handle = task_set.spawn(async move {
+            let block_number = block_prover_input.get_block_number();
+            info!("Proving block {block_number}");
+            // Prove the block
+            let block_proof = prove_block(
+                block_prover_input,
+                runtime,
+                previous_block_proof,
+                prover_config.clone(),
+            )
+            .then(move |proof| async move {
+                drop(prove_permit);
+                let proof = proof.inspect_err(|e| {
+                    error!("failed to generate proof for block {block_number}, error {e:?}")
+                })?;
+                let block_number = proof.b_height;
 
-                        // Write latest generated proof to disk if proof_output_dir is provided
-                        let return_proof: Option<GeneratedBlockProof> =
-                            if proof_output_dir.is_some() {
-                                ProverInput::write_proof(proof_output_dir, &proof).await?;
-                                None
-                            } else {
-                                Some(proof.clone())
-                            };
-
-                        if tx.send(proof).is_err() {
-                            anyhow::bail!("Failed to send proof");
-                        }
-
-                        Ok((block_number, return_proof))
-                    })
-                    .boxed();
-
-                prev = Some(Box::pin(rx.map_err(anyhow::Error::new)));
-
-                fut
-            })
-            .collect();
-
-        results.try_collect().await
-    }
-
-    /// Write the proof to the disk (if `output_dir` is provided) or stdout.
-    pub(crate) async fn write_proof(
-        output_dir: Option<PathBuf>,
-        proof: &GeneratedBlockProof,
-    ) -> Result<()> {
-        let proof_serialized = serde_json::to_vec(proof)?;
-        let block_proof_file_path =
-            output_dir.map(|path| generate_block_proof_file_name(&path.to_str(), proof.b_height));
-        match block_proof_file_path {
-            Some(p) => {
-                if let Some(parent) = p.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
+                // Write proof to disk if block is last in block batch,
+                // or if the block is last in the interval (it contains all the necessary
+                // information to verify the whole sequence). If flag
+                // `keep_intermediate_proofs` is set, output all block proofs to disk.
+                let is_block_batch_finished =
+                    block_counter % prover_config.block_batch_size as u64 == 0;
+                if !prover_config.test_only
+                    && (is_last_block
+                        || prover_config.keep_intermediate_proofs
+                        || is_block_batch_finished)
+                {
+                    write_proof_to_dir(&prover_config.proof_output_dir, proof.clone())
+                        .await
+                        .inspect_err(|e| error!("failed to output proof for block {block_number} to directory {e:?}"))?;
                 }
 
-                let mut f = tokio::fs::File::create(p).await?;
-                f.write_all(&proof_serialized)
-                    .await
-                    .context("Failed to write proof to disk")
-            }
-            None => tokio::io::stdout()
-                .write_all(&proof_serialized)
-                .await
-                .context("Failed to write proof to stdout"),
+                if tx.send(proof).is_err() {
+                    anyhow::bail!("Failed to send proof for block {block_number}");
+                }
+
+                Ok(block_number)
+            })
+            .await;
+
+            Ok(block_proof)
+        });
+        prev_proof = Some(Box::pin(rx.map_err(move |e| {
+            error!("failed to receive previous proof for block {block_number}: {e:?}");
+            anyhow::Error::new(e)
+        })));
+        if is_last_block {
+            break;
         }
     }
+
+    while let Some(res) = task_set.join_next().await {
+        let _proved_block_height = res???;
+    }
+    Ok(())
+}
+
+/// Write the proof to the `output_dir` directory.
+async fn write_proof_to_dir(output_dir: &Path, proof: GeneratedBlockProof) -> Result<()> {
+    // Check if output directory exists, and create one if it doesn't.
+    if !output_dir.exists() {
+        info!("Created output directory {:?}", output_dir.display());
+        std::fs::create_dir(output_dir)?;
+    }
+
+    let block_proof_file_path =
+        generate_block_proof_file_name(&output_dir.to_str(), proof.b_height);
+
+    // Serialize as a single element array to match the expected format.
+    let proof_serialized = serde_json::to_vec(&vec![proof])?;
+
+    if let Some(parent) = block_proof_file_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut f = tokio::fs::File::create(block_proof_file_path.clone()).await?;
+    f.write_all(&proof_serialized)
+        .await
+        .context("Failed to write proof to disk")?;
+
+    info!(
+        "Successfully wrote to disk proof file {}",
+        block_proof_file_path.display()
+    );
+    Ok(())
 }

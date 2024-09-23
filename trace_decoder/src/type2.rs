@@ -184,7 +184,8 @@ fn node2trie(
             }
             SmtLeafType::Storage(it) => {
                 ensure!(collated.storage_root.is_none(), "double write of field");
-                // TODO(0xaatif): do we not do anything with the storage here?
+                // TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+                //                do we not do anything with the storage here?
                 smt_trie::keys::key_storage(address, ethereum_types::U256::from_big_endian(&it))
             }
             SmtLeafType::CodeLength => smt_trie::keys::key_code_length(address),
@@ -225,12 +226,11 @@ fn iter_leaves(node: Node) -> Box<dyn Iterator<Item = (BitVec, Either<[u8; 32], 
 
 #[test]
 fn test_tries() {
-    for (ix, case) in serde_json::from_str::<Vec<super::Case>>(include_str!(
-        "../tests/data/tries/hermez_cdk_erigon.json"
-    ))
-    .unwrap()
-    .into_iter()
-    .enumerate()
+    for (ix, case) in
+        serde_json::from_str::<Vec<super::Case>>(include_str!("cases/hermez_cdk_erigon.json"))
+            .unwrap()
+            .into_iter()
+            .enumerate()
     {
         println!("case {}", ix);
         let instructions = crate::wire::parse(&case.bytes).unwrap();

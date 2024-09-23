@@ -7,19 +7,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, ensure, Context as _};
 use either::Either;
 use evm_arithmetization::generation::mpt::AccountRlp;
+use keccak_hash::H256;
+use mpt_trie::partial_trie::OnOrphanedHashNode;
 use nunny::NonEmpty;
 use u4::U4;
 
-use crate::typed_mpt::{StateTrie, StorageTrie, TriePath};
+use crate::typed_mpt::{StateMpt, StateTrie as _, StorageTrie, TrieKey};
 use crate::wire::{Instruction, SmtLeaf};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Frontend {
-    pub state: StateTrie,
+    pub state: StateMpt,
     pub code: BTreeSet<NonEmpty<Vec<u8>>>,
-    /// The key here matches the [`TriePath`] inside [`Self::state`] for
-    /// accounts which had inline storage.
-    pub storage: BTreeMap<TriePath, StorageTrie>,
+    pub storage: BTreeMap<H256, StorageTrie>,
+}
+
+impl Default for Frontend {
+    // This frontend is intended to be used with our custom `zeroTracer`,
+    // which covers branch-to-extension collapse edge cases.
+    fn default() -> Self {
+        Self {
+            state: StateMpt::new(OnOrphanedHashNode::CollapseToExtension),
+            code: BTreeSet::new(),
+            storage: BTreeMap::new(),
+        }
+    }
 }
 
 pub fn frontend(instructions: impl IntoIterator<Item = Instruction>) -> anyhow::Result<Frontend> {
@@ -54,10 +66,12 @@ fn visit(
         Node::Hash(Hash { raw_hash }) => {
             frontend
                 .state
-                .insert_hash_by_path(TriePath::new(path.iter().copied())?, raw_hash.into())?;
+                .insert_hash_by_key(TrieKey::new(path.iter().copied())?, raw_hash.into())?;
         }
         Node::Leaf(Leaf { key, value }) => {
-            let path = TriePath::new(path.iter().copied().chain(key))?;
+            let path = TrieKey::new(path.iter().copied().chain(key))?
+                .into_hash()
+                .context("invalid depth for leaf of state trie")?;
             match value {
                 Either::Left(Value { .. }) => bail!("unsupported value node at top level"),
                 Either::Right(Account {
@@ -91,7 +105,8 @@ fn visit(
                             }
                         },
                     };
-                    let clobbered = frontend.state.insert_by_path(path, account)?;
+                    #[expect(deprecated)] // this is MPT-specific code
+                    let clobbered = frontend.state.insert_by_hashed_address(path, account)?;
                     ensure!(clobbered.is_none(), "duplicate account");
                 }
             }
@@ -126,12 +141,12 @@ fn node2storagetrie(node: Node) -> anyhow::Result<StorageTrie> {
     ) -> anyhow::Result<()> {
         match node {
             Node::Hash(Hash { raw_hash }) => {
-                mpt.insert_hash(TriePath::new(path.iter().copied())?, raw_hash.into())?;
+                mpt.insert_hash(TrieKey::new(path.iter().copied())?, raw_hash.into())?;
             }
             Node::Leaf(Leaf { key, value }) => {
                 match value {
                     Either::Left(Value { raw_value }) => mpt.insert(
-                        TriePath::new(path.iter().copied().chain(key))?,
+                        TrieKey::new(path.iter().copied().chain(key))?,
                         rlp::encode(&raw_value.as_slice()).to_vec(),
                     )?,
                     Either::Right(_) => bail!("unexpected account node in storage trie"),
@@ -157,7 +172,7 @@ fn node2storagetrie(node: Node) -> anyhow::Result<StorageTrie> {
         Ok(())
     }
 
-    let mut mpt = StorageTrie::default();
+    let mut mpt = StorageTrie::new(OnOrphanedHashNode::CollapseToExtension);
     visit(&mut mpt, &stackstack::Stack::new(), node)?;
     Ok(mpt)
 }
@@ -258,7 +273,8 @@ fn execute(
                 has_storage,
             } => {
                 // BUG: the spec sometimes writes Node::Account with 5 fields..
-                // TODO(0xaatif): should these fields even be optional?
+                // TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+                //                should these fields even be optional?
                 let nonce = nonce.unwrap_or_default();
                 let balance = balance.unwrap_or_default();
                 let account = match (has_code, has_storage) {
@@ -364,21 +380,20 @@ fn finish_stack(v: &mut Vec<Node>) -> anyhow::Result<Execution> {
 
 #[test]
 fn test_tries() {
-    for (ix, case) in serde_json::from_str::<Vec<super::Case>>(include_str!(
-        "../tests/data/tries/zero_jerigon.json"
-    ))
-    .unwrap()
-    .into_iter()
-    .enumerate()
+    for (ix, case) in
+        serde_json::from_str::<Vec<super::Case>>(include_str!("cases/zero_jerigon.json"))
+            .unwrap()
+            .into_iter()
+            .enumerate()
     {
         println!("case {}", ix);
         let instructions = crate::wire::parse(&case.bytes).unwrap();
         let frontend = frontend(instructions).unwrap();
         assert_eq!(case.expected_state_root, frontend.state.root());
 
-        for (path, acct) in &frontend.state {
-            if acct.storage_root != StateTrie::default().root() {
-                assert!(frontend.storage.contains_key(&path))
+        for (haddr, acct) in frontend.state.iter() {
+            if acct.storage_root != StateMpt::default().root() {
+                assert!(frontend.storage.contains_key(&haddr))
             }
         }
     }

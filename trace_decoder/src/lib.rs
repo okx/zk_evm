@@ -17,7 +17,8 @@
 //! - Performance - this won't be the bottleneck in any proving system.
 //! - Robustness - malicious or malformed input may crash this library.
 //!
-//! TODO(0xaatif): refactor all the docs below
+//! TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+//!                refactor all the docs below
 //!
 //! It might not be obvious why we need traces for each txn in order to generate
 //! proofs. While it's true that we could just run all the txns of a block in an
@@ -83,28 +84,29 @@ const _DEVELOPER_DOCS: () = ();
 
 /// Defines the main functions used to generate the IR.
 mod decoding;
-// TODO(0xaatif): add backend/prod support
 /// Defines functions that processes a [BlockTrace] so that it is easier to turn
 /// the block transactions into IRs.
 mod processed_block_trace;
 mod type1;
+// TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+//                add backend/prod support for type 2
 #[cfg(test)]
 #[allow(dead_code)]
 mod type2;
 mod typed_mpt;
 mod wire;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ethereum_types::{Address, U256};
 use evm_arithmetization::proof::{BlockHashes, BlockMetadata};
 use evm_arithmetization::GenerationInputs;
 use keccak_hash::keccak as hash;
 use keccak_hash::H256;
-use mpt_trie::partial_trie::HashedPartialTrie;
-use processed_block_trace::ProcessedTxnInfo;
+use mpt_trie::partial_trie::{HashedPartialTrie, OnOrphanedHashNode};
+use processed_block_trace::ProcessedTxnBatchInfo;
 use serde::{Deserialize, Serialize};
-use typed_mpt::{StateTrie, StorageTrie, TriePath};
+use typed_mpt::{StateMpt, StateTrie as _, StorageTrie, TrieKey};
 
 /// Core payload needed to generate proof for a block.
 /// Additional data retrievable from the blockchain node (using standard ETH RPC
@@ -119,9 +121,10 @@ pub struct BlockTrace {
     /// the execution of the current block) in multiple possible formats.
     pub trie_pre_images: BlockTraceTriePreImages,
 
-    /// The code_db is a map of code hashes to the actual code. This is needed
-    /// to execute transactions.
-    pub code_db: Option<HashMap<H256, Vec<u8>>>,
+    /// A collection of contract code.
+    /// This will be accessed by its hash internally.
+    #[serde(default)]
+    pub code_db: BTreeSet<Vec<u8>>,
 
     /// Traces and other info per transaction. The index of the transaction
     /// within the block corresponds to the slot in this vec.
@@ -182,7 +185,7 @@ pub struct TxnInfo {
     ///   state for the start of each txn.
     /// - Create minimal partial tries needed for proof gen based on what state
     ///   the txn accesses. (eg. What trie nodes are accessed).
-    pub traces: HashMap<Address, TxnTrace>,
+    pub traces: BTreeMap<Address, TxnTrace>,
 
     /// Data that is specific to the txn as a whole.
     pub meta: TxnMeta,
@@ -191,15 +194,11 @@ pub struct TxnInfo {
 /// Structure holding metadata for one transaction.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TxnMeta {
-    /// Txn byte code.
+    /// Txn byte code. This is also the raw RLP bytestring inserted into the txn
+    /// trie by this txn. Note that the key is not included and this is only
+    /// the rlped value of the node!
     #[serde(with = "crate::hex")]
     pub byte_code: Vec<u8>,
-
-    /// Rlped bytes of the new txn value inserted into the txn trie by
-    /// this txn. Note that the key is not included and this is only the rlped
-    /// value of the node!
-    #[serde(with = "crate::hex")]
-    pub new_txn_trie_node_byte: Vec<u8>,
 
     /// Rlped bytes of the new receipt value inserted into the receipt trie by
     /// this txn. Note that the key is not included and this is only the rlped
@@ -215,7 +214,7 @@ pub struct TxnMeta {
 ///
 /// Specifically, since we can not execute the txn before proof generation, we
 /// rely on a separate EVM to run the txn and supply this data for us.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct TxnTrace {
     /// If the balance changed, then the new balance will appear here. Will be
     /// `None` if no change.
@@ -227,21 +226,27 @@ pub struct TxnTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<U256>,
 
-    /// Account addresses that were only read by the txn.
-    ///
-    /// Note that if storage is written to, then it does not need to appear in
-    /// this list (but is also fine if it does).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub storage_read: Option<Vec<H256>>,
+    /// <code>[hash](hash)([Address])</code> of storages read by the
+    /// transaction.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub storage_read: BTreeSet<H256>,
 
-    /// Account storage locations that were mutated by the txn along with their
-    /// new value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub storage_written: Option<HashMap<H256, U256>>,
+    /// <code>[hash](hash)([Address])</code> of storages written by the
+    /// transaction, with their new value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub storage_written: BTreeMap<H256, U256>,
 
     /// Contract code that this account has accessed or created
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_usage: Option<ContractCodeUsage>,
+
+    /// True if the account got self-destructed at the end of this txn.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub self_destructed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Contract code access type. Used by txn traces.
@@ -254,15 +259,6 @@ pub enum ContractCodeUsage {
     /// Contract was created (and these are the bytes). Note that this new
     /// contract code will not appear in the [`BlockTrace`] map.
     Write(#[serde(with = "crate::hex")] Vec<u8>),
-}
-
-impl ContractCodeUsage {
-    fn get_code_hash(&self) -> H256 {
-        match self {
-            ContractCodeUsage::Read(hash) => *hash,
-            ContractCodeUsage::Write(bytes) => hash(bytes),
-        }
-    }
 }
 
 /// Other data that is needed for proof gen.
@@ -291,13 +287,14 @@ pub struct BlockLevelData {
 pub fn entrypoint(
     trace: BlockTrace,
     other: OtherBlockData,
-    resolve: impl Fn(H256) -> Vec<u8>,
+    mut batch_size: usize,
+    use_burn_addr: bool,
 ) -> anyhow::Result<Vec<GenerationInputs>> {
     use anyhow::Context as _;
     use mpt_trie::partial_trie::PartialTrie as _;
 
     use crate::processed_block_trace::{
-        CodeHashResolving, ProcessedBlockTrace, ProcessedBlockTracePreImages,
+        Hash2Code, ProcessedBlockTrace, ProcessedBlockTracePreImages,
     };
     use crate::PartialTriePreImages;
     use crate::{
@@ -318,19 +315,21 @@ pub fn entrypoint(
         }) => ProcessedBlockTracePreImages {
             tries: PartialTriePreImages {
                 state: state.items().try_fold(
-                    StateTrie::default(),
+                    StateMpt::new(OnOrphanedHashNode::Reject),
                     |mut acc, (nibbles, hash_or_val)| {
-                        let path = TriePath::from_nibbles(nibbles);
+                        let path = TrieKey::from_nibbles(nibbles);
                         match hash_or_val {
                             mpt_trie::trie_ops::ValOrHash::Val(bytes) => {
-                                acc.insert_by_path(
-                                    path,
+                                #[expect(deprecated)] // this is MPT specific
+                                acc.insert_by_hashed_address(
+                                    path.into_hash()
+                                        .context("invalid path length in direct state trie")?,
                                     rlp::decode(&bytes)
                                         .context("invalid AccountRlp in direct state trie")?,
                                 )?;
                             }
                             mpt_trie::trie_ops::ValOrHash::Hash(h) => {
-                                acc.insert_hash_by_path(path, h)?;
+                                acc.insert_hash_by_key(path, h)?;
                             }
                         };
                         anyhow::Ok(acc)
@@ -340,18 +339,21 @@ pub fn entrypoint(
                     .into_iter()
                     .map(|(k, SeparateTriePreImage::Direct(v))| {
                         v.items()
-                            .try_fold(StorageTrie::default(), |mut acc, (nibbles, hash_or_val)| {
-                                let path = TriePath::from_nibbles(nibbles);
-                                match hash_or_val {
-                                    mpt_trie::trie_ops::ValOrHash::Val(value) => {
-                                        acc.insert(path, value)?;
-                                    }
-                                    mpt_trie::trie_ops::ValOrHash::Hash(h) => {
-                                        acc.insert_hash(path, h)?;
-                                    }
-                                };
-                                anyhow::Ok(acc)
-                            })
+                            .try_fold(
+                                StorageTrie::new(OnOrphanedHashNode::Reject),
+                                |mut acc, (nibbles, hash_or_val)| {
+                                    let path = TrieKey::from_nibbles(nibbles);
+                                    match hash_or_val {
+                                        mpt_trie::trie_ops::ValOrHash::Val(value) => {
+                                            acc.insert(path, value)?;
+                                        }
+                                        mpt_trie::trie_ops::ValOrHash::Hash(h) => {
+                                            acc.insert_hash(path, h)?;
+                                        }
+                                    };
+                                    anyhow::Ok(acc)
+                                },
+                            )
                             .map(|v| (k, v))
                     })
                     .collect::<Result<_, _>>()?,
@@ -369,10 +371,7 @@ pub fn entrypoint(
             ProcessedBlockTracePreImages {
                 tries: PartialTriePreImages {
                     state,
-                    storage: storage
-                        .into_iter()
-                        .map(|(path, trie)| (path.into_hash_left_padded(), trie))
-                        .collect(),
+                    storage: storage.into_iter().collect(),
                 },
                 extra_code_hash_mappings: match code.is_empty() {
                     true => None,
@@ -386,30 +385,29 @@ pub fn entrypoint(
         }
     };
 
-    let all_accounts_in_pre_images = pre_images
-        .tries
-        .state
-        .iter()
-        .map(|(addr, data)| (addr.into_hash_left_padded(), data))
-        .collect::<Vec<_>>();
+    let all_accounts_in_pre_images = pre_images.tries.state.iter().collect::<Vec<_>>();
 
-    let code_db = {
-        let mut code_db = code_db.unwrap_or_default();
-        if let Some(code_mappings) = pre_images.extra_code_hash_mappings {
-            code_db.extend(code_mappings);
-        }
-        code_db
-    };
+    // Note we discard any user-provided hashes.
+    let mut hash2code = code_db
+        .into_iter()
+        .chain(
+            pre_images
+                .extra_code_hash_mappings
+                .unwrap_or_default()
+                .into_values(),
+        )
+        .collect::<Hash2Code>();
 
-    let mut code_hash_resolver = CodeHashResolving {
-        client_code_hash_resolve_f: |it: &ethereum_types::H256| resolve(*it),
-        extra_code_hash_mappings: code_db,
-    };
+    // Make sure the batch size is smaller than the total number of transactions,
+    // or we would need to generate dummy proofs for the aggregation layers.
+    if batch_size > txn_info.len() {
+        batch_size = txn_info.len() / 2 + 1;
+    }
 
-    let last_tx_idx = txn_info.len().saturating_sub(1);
+    let last_tx_idx = txn_info.len().saturating_sub(1) / batch_size;
 
     let mut txn_info = txn_info
-        .into_iter()
+        .chunks(batch_size)
         .enumerate()
         .map(|(i, t)| {
             let extra_state_accesses = if last_tx_idx == i {
@@ -419,23 +417,24 @@ pub fn entrypoint(
                     .b_data
                     .withdrawals
                     .iter()
-                    .map(|(addr, _)| crate::hash(addr.as_bytes()))
+                    .map(|(addr, _)| *addr)
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
 
-            t.into_processed_txn_info(
+            TxnInfo::into_processed_txn_info(
+                t,
                 &pre_images.tries,
                 &all_accounts_in_pre_images,
                 &extra_state_accesses,
-                &mut code_hash_resolver,
+                &mut hash2code,
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     while txn_info.len() < 2 {
-        txn_info.insert(0, ProcessedTxnInfo::default());
+        txn_info.push(ProcessedTxnBatchInfo::default());
     }
 
     decoding::into_txn_proof_gen_ir(
@@ -445,19 +444,19 @@ pub fn entrypoint(
             withdrawals: other.b_data.withdrawals.clone(),
         },
         other,
+        use_burn_addr,
+        batch_size,
     )
 }
 
 #[derive(Debug, Default)]
 struct PartialTriePreImages {
-    pub state: StateTrie,
+    pub state: StateMpt,
     pub storage: HashMap<H256, StorageTrie>,
 }
 
 /// Like `#[serde(with = "hex")`, but tolerates and emits leading `0x` prefixes
 mod hex {
-    use std::{borrow::Cow, fmt};
-
     use serde::{de::Error as _, Deserialize as _, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
@@ -471,14 +470,31 @@ mod hex {
     pub fn deserialize<'de, D: Deserializer<'de>, T>(deserializer: D) -> Result<T, D::Error>
     where
         T: hex::FromHex,
-        T::Error: fmt::Display,
+        T::Error: std::fmt::Display,
     {
-        let s = Cow::<str>::deserialize(deserializer)?;
+        let s = String::deserialize(deserializer)?;
         match s.strip_prefix("0x") {
             Some(rest) => T::from_hex(rest),
             None => T::from_hex(&*s),
         }
         .map_err(D::Error::custom)
+    }
+}
+
+trait TryIntoExt<T> {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn try_into(self) -> Result<T, Self::Error>;
+}
+
+impl<ThisT, T, E> TryIntoExt<T> for ThisT
+where
+    ThisT: TryInto<T, Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Error = ThisT::Error;
+
+    fn try_into(self) -> Result<T, Self::Error> {
+        TryInto::try_into(self)
     }
 }
 

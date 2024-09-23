@@ -1,3 +1,5 @@
+#![cfg(not(feature = "cdk_erigon"))]
+
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -14,9 +16,8 @@ use crate::generation::mpt::{AccountRlp, LegacyReceiptRlp};
 use crate::generation::TrieInputs;
 use crate::proof::{BlockHashes, BlockMetadata, TrieRoots};
 use crate::testing_utils::{
-    beacon_roots_account_nibbles, beacon_roots_contract_from_storage, ger_account_nibbles,
+    beacon_roots_account_nibbles, beacon_roots_contract_from_storage,
     preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
-    GLOBAL_EXIT_ROOT_ACCOUNT,
 };
 use crate::GenerationInputs;
 
@@ -147,12 +148,6 @@ fn test_add11_yml() {
             )
             .unwrap();
         expected_state_trie_after
-            .insert(
-                ger_account_nibbles(),
-                rlp::encode(&GLOBAL_EXIT_ROOT_ACCOUNT).to_vec(),
-            )
-            .unwrap();
-        expected_state_trie_after
     };
     let receipt_0 = LegacyReceiptRlp {
         status: true,
@@ -180,9 +175,10 @@ fn test_add11_yml() {
     };
 
     let inputs = GenerationInputs {
-        signed_txn: Some(txn.to_vec()),
+        signed_txns: vec![txn.to_vec()],
+        burn_addr: None,
         withdrawals: vec![],
-        global_exit_roots: vec![],
+        ger_data: None,
         tries: tries_before,
         trie_roots_after,
         contract_code: contract_code.clone(),
@@ -198,9 +194,9 @@ fn test_add11_yml() {
     };
 
     let initial_stack = vec![];
-    let initial_offset = KERNEL.global_labels["main"];
+    let initial_offset = KERNEL.global_labels["init"];
     let mut interpreter: Interpreter<F> =
-        Interpreter::new_with_generation_inputs(initial_offset, initial_stack, inputs);
+        Interpreter::new_with_generation_inputs(initial_offset, initial_stack, &inputs, None);
 
     interpreter.set_is_kernel(true);
     interpreter.run().expect("Proving add11 failed.");
@@ -327,12 +323,6 @@ fn test_add11_yml_with_exception() {
             )
             .unwrap();
         expected_state_trie_after
-            .insert(
-                ger_account_nibbles(),
-                rlp::encode(&GLOBAL_EXIT_ROOT_ACCOUNT).to_vec(),
-            )
-            .unwrap();
-        expected_state_trie_after
     };
 
     let receipt_0 = LegacyReceiptRlp {
@@ -361,9 +351,10 @@ fn test_add11_yml_with_exception() {
     };
 
     let inputs = GenerationInputs {
-        signed_txn: Some(txn.to_vec()),
+        signed_txns: vec![txn.to_vec()],
+        burn_addr: None,
         withdrawals: vec![],
-        global_exit_roots: vec![],
+        ger_data: None,
         tries: tries_before,
         trie_roots_after,
         contract_code: contract_code.clone(),
@@ -379,9 +370,9 @@ fn test_add11_yml_with_exception() {
     };
 
     let initial_stack = vec![];
-    let initial_offset = KERNEL.global_labels["main"];
+    let initial_offset = KERNEL.global_labels["init"];
     let mut interpreter: Interpreter<F> =
-        Interpreter::new_with_generation_inputs(initial_offset, initial_stack, inputs);
+        Interpreter::new_with_generation_inputs(initial_offset, initial_stack, &inputs, None);
 
     interpreter.set_is_kernel(true);
     interpreter

@@ -65,13 +65,16 @@ fn observe_block_metadata<
     challenger.observe_element(basefee.0);
     challenger.observe_element(basefee.1);
     challenger.observe_element(u256_to_u32(block_metadata.block_gas_used)?);
-    let blob_gas_used = u256_to_u64(block_metadata.block_blob_gas_used)?;
-    challenger.observe_element(blob_gas_used.0);
-    challenger.observe_element(blob_gas_used.1);
-    let excess_blob_gas = u256_to_u64(block_metadata.block_excess_blob_gas)?;
-    challenger.observe_element(excess_blob_gas.0);
-    challenger.observe_element(excess_blob_gas.1);
-    challenger.observe_elements(&h256_limbs::<F>(block_metadata.parent_beacon_block_root));
+    #[cfg(feature = "eth_mainnet")]
+    {
+        let blob_gas_used = u256_to_u64(block_metadata.block_blob_gas_used)?;
+        challenger.observe_element(blob_gas_used.0);
+        challenger.observe_element(blob_gas_used.1);
+        let excess_blob_gas = u256_to_u64(block_metadata.block_excess_blob_gas)?;
+        challenger.observe_element(excess_blob_gas.0);
+        challenger.observe_element(excess_blob_gas.1);
+        challenger.observe_elements(&h256_limbs::<F>(block_metadata.parent_beacon_block_root));
+    }
     for i in 0..8 {
         challenger.observe_elements(&u256_limbs(block_metadata.block_bloom[i]));
     }
@@ -98,9 +101,12 @@ fn observe_block_metadata_target<
     challenger.observe_element(block_metadata.block_chain_id);
     challenger.observe_elements(&block_metadata.block_base_fee);
     challenger.observe_element(block_metadata.block_gas_used);
-    challenger.observe_elements(&block_metadata.block_blob_gas_used);
-    challenger.observe_elements(&block_metadata.block_excess_blob_gas);
-    challenger.observe_elements(&block_metadata.parent_beacon_block_root);
+    #[cfg(feature = "eth_mainnet")]
+    {
+        challenger.observe_elements(&block_metadata.block_blob_gas_used);
+        challenger.observe_elements(&block_metadata.block_excess_blob_gas);
+        challenger.observe_elements(&block_metadata.parent_beacon_block_root);
+    }
     challenger.observe_elements(&block_metadata.block_bloom);
 }
 
@@ -136,6 +142,33 @@ fn observe_extra_block_data_target<
     challenger.observe_element(extra_data.txn_number_after);
     challenger.observe_element(extra_data.gas_used_before);
     challenger.observe_element(extra_data.gas_used_after);
+}
+
+#[cfg(feature = "cdk_erigon")]
+fn observe_burn_addr<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    challenger: &mut Challenger<F, C::Hasher>,
+    burn_addr: U256,
+) -> Result<(), ProgramError> {
+    challenger.observe_elements(&u256_limbs(burn_addr));
+    Ok(())
+}
+
+#[cfg(feature = "cdk_erigon")]
+/// This will panic if no burn address was specified.  
+fn observe_burn_addr_target<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    challenger: &mut RecursiveChallenger<F, C::Hasher, D>,
+    burn_addr: BurnAddrTarget,
+) where
+    C::Hasher: AlgebraicHasher<F>,
+{
+    match burn_addr {
+        BurnAddrTarget::BurnAddr(addr) => challenger.observe_elements(&addr),
+        BurnAddrTarget::Burnt() => panic!("There should be an address set in cdk_erigon."),
+    }
 }
 
 fn observe_block_hashes<
@@ -178,7 +211,19 @@ pub(crate) fn observe_public_values<
     observe_trie_roots::<F, C, D>(challenger, &public_values.trie_roots_after);
     observe_block_metadata::<F, C, D>(challenger, &public_values.block_metadata)?;
     observe_block_hashes::<F, C, D>(challenger, &public_values.block_hashes);
-    observe_extra_block_data::<F, C, D>(challenger, &public_values.extra_block_data)
+    observe_extra_block_data::<F, C, D>(challenger, &public_values.extra_block_data)?;
+
+    #[cfg(feature = "cdk_erigon")]
+    {
+        observe_burn_addr::<F, C, D>(
+            challenger,
+            public_values
+                .burn_addr
+                .expect("There should be an address set in cdk_erigon."),
+        )?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn observe_public_values_target<
@@ -196,6 +241,8 @@ pub(crate) fn observe_public_values_target<
     observe_block_metadata_target::<F, C, D>(challenger, &public_values.block_metadata);
     observe_block_hashes_target::<F, C, D>(challenger, &public_values.block_hashes);
     observe_extra_block_data_target::<F, C, D>(challenger, &public_values.extra_block_data);
+    #[cfg(feature = "cdk_erigon")]
+    observe_burn_addr_target::<F, C, D>(challenger, public_values.burn_addr.clone());
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> AllProof<F, C, D> {

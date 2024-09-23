@@ -219,6 +219,9 @@ fn expand_macros(
                     expanded.extend(expand_macros(body.clone(), macros, macro_counter));
                 }
             }
+            Item::ConditionalBlock(_, items) => {
+                expanded.extend(expand_macros(items.clone(), macros, macro_counter));
+            }
             item => {
                 expanded.push(item);
             }
@@ -761,7 +764,10 @@ mod tests {
         constants: HashMap<String, U256>,
         optimize: bool,
     ) -> Kernel {
-        let parsed_files = files.iter().map(|f| parse(f, HashSet::new())).collect_vec();
+        let parsed_files = files
+            .iter()
+            .map(|f| parse(f, &HashSet::new()))
+            .collect_vec();
         assemble(parsed_files, constants, optimize)
     }
 }

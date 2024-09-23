@@ -6,11 +6,10 @@ use dotenvy::dotenv;
 use ops::register;
 use paladin::runtime::WorkerRuntime;
 use zero_bin_common::prover_state::{
-    cli::CliProverStateConfig, persistence::set_circuit_cache_dir_env_if_not_set,
+    cli::CliProverStateConfig,
+    persistence::{set_circuit_cache_dir_env_if_not_set, CIRCUIT_VERSION},
 };
-use zero_bin_common::version;
-
-mod init;
+use zero_bin_common::{tracing, version};
 
 // TODO: https://github.com/0xPolygonZero/zk_evm/issues/302
 //       this should probably be removed.
@@ -31,7 +30,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.contains(&"--version".to_string()) {
         version::print_version(
-            env!("EVM_ARITHMETIZATION_PKG_VER"),
+            CIRCUIT_VERSION.as_str(),
             env!("VERGEN_RUSTC_COMMIT_HASH"),
             env!("VERGEN_BUILD_TIMESTAMP"),
         );
@@ -39,7 +38,7 @@ async fn main() -> Result<()> {
     }
 
     dotenv().ok();
-    init::tracing();
+    tracing::init();
     set_circuit_cache_dir_env_if_not_set()?;
     let args = Cli::parse();
 

@@ -7,7 +7,7 @@ use plonky2::field::extension::Extendable;
 use plonky2::gates::exponentiation::ExponentiationGate;
 use plonky2::gates::gate::GateRef;
 use plonky2::gates::noop::NoopGate;
-use plonky2::hash::hash_types::RichField;
+use plonky2::hash::hash_types::{HashOut, MerkleCapTarget, RichField};
 use plonky2::hash::hashing::PlonkyPermutation;
 use plonky2::iop::challenger::RecursiveChallenger;
 use plonky2::iop::target::Target;
@@ -35,8 +35,10 @@ use crate::cpu::kernel::constants::global_metadata::GlobalMetadata;
 use crate::memory::segments::Segment;
 use crate::memory::VALUE_LIMBS;
 use crate::proof::{
-    BlockHashes, BlockHashesTarget, BlockMetadata, BlockMetadataTarget, ExtraBlockData,
-    ExtraBlockDataTarget, PublicValues, PublicValuesTarget, TrieRoots, TrieRootsTarget,
+    BlockHashes, BlockHashesTarget, BlockMetadata, BlockMetadataTarget, BurnAddrTarget,
+    ExtraBlockData, ExtraBlockDataTarget, FinalPublicValues, FinalPublicValuesTarget, MemCap,
+    MemCapTarget, PublicValues, PublicValuesTarget, RegistersData, RegistersDataTarget, TrieRoots,
+    TrieRootsTarget, DEFAULT_CAP_LEN,
 };
 use crate::util::{h256_limbs, u256_limbs, u256_to_u32, u256_to_u64};
 use crate::witness::errors::ProgramError;
@@ -115,6 +117,7 @@ where
         buffer.write_target(self.zero_target)?;
         self.stark_proof_target.to_buffer(buffer)?;
         self.ctl_challenges_target.to_buffer(buffer)?;
+
         Ok(())
     }
 
@@ -130,6 +133,7 @@ where
         let zero_target = buffer.read_target()?;
         let stark_proof_target = StarkProofTarget::from_buffer(buffer)?;
         let ctl_challenges_target = GrandProductChallengeSet::from_buffer(buffer)?;
+
         Ok(Self {
             circuit,
             stark_proof_target,
@@ -376,10 +380,12 @@ pub(crate) fn get_memory_extra_looking_sum_circuit<F: RichField + Extendable<D>,
         ),
     ];
 
-    // This contains the `block_beneficiary`, `block_random`, `block_base_fee`,
-    // `block_blob_gas_used`, `block_excess_blob_gas`, `parent_beacon_block_root`
-    // as well as `cur_hash`.
-    let block_fields_arrays: [(GlobalMetadata, &[Target]); 7] = [
+    // This contains the `block_beneficiary`, `block_random`, `block_base_fee`, and
+    // `cur_hash`, as well as the additional `block_blob_gas_used`,
+    // `block_excess_blob_gas`, `parent_beacon_block_root` when compiling with
+    // `eth_mainnet` feature flag.
+    const LENGTH: usize = if cfg!(feature = "eth_mainnet") { 7 } else { 4 };
+    let block_fields_arrays: [(GlobalMetadata, &[Target]); LENGTH] = [
         (
             GlobalMetadata::BlockBeneficiary,
             &public_values.block_metadata.block_beneficiary,
@@ -392,14 +398,17 @@ pub(crate) fn get_memory_extra_looking_sum_circuit<F: RichField + Extendable<D>,
             GlobalMetadata::BlockBaseFee,
             &public_values.block_metadata.block_base_fee,
         ),
+        #[cfg(feature = "eth_mainnet")]
         (
             GlobalMetadata::BlockBlobGasUsed,
             &public_values.block_metadata.block_blob_gas_used,
         ),
+        #[cfg(feature = "eth_mainnet")]
         (
             GlobalMetadata::BlockExcessBlobGas,
             &public_values.block_metadata.block_excess_blob_gas,
         ),
+        #[cfg(feature = "eth_mainnet")]
         (
             GlobalMetadata::ParentBeaconBlockRoot,
             &public_values.block_metadata.parent_beacon_block_root,
@@ -423,6 +432,22 @@ pub(crate) fn get_memory_extra_looking_sum_circuit<F: RichField + Extendable<D>,
             &[target],
         );
     });
+
+    #[cfg(feature = "cdk_erigon")]
+    {
+        let burn_addr = match public_values.burn_addr {
+            BurnAddrTarget::BurnAddr(addr) => addr,
+            BurnAddrTarget::Burnt() => panic!("There should be an address set in cdk_erigon."),
+        };
+        sum = add_data_write(
+            builder,
+            challenge,
+            sum,
+            metadata_segment,
+            GlobalMetadata::BurnAddr.unscale(),
+            &burn_addr,
+        );
+    }
 
     block_fields_arrays.map(|(field, targets)| {
         sum = add_data_write(
@@ -523,6 +548,47 @@ pub(crate) fn get_memory_extra_looking_sum_circuit<F: RichField + Extendable<D>,
         &[kernel_len_target],
     );
 
+    // Write registers.
+    let registers_segment =
+        builder.constant(F::from_canonical_usize(Segment::RegistersStates.unscale()));
+    let registers_before: [&[Target]; 6] = [
+        &[public_values.registers_before.program_counter],
+        &[public_values.registers_before.is_kernel],
+        &[public_values.registers_before.stack_len],
+        &public_values.registers_before.stack_top,
+        &[public_values.registers_before.context],
+        &[public_values.registers_before.gas_used],
+    ];
+    for i in 0..registers_before.len() {
+        sum = add_data_write(
+            builder,
+            challenge,
+            sum,
+            registers_segment,
+            i,
+            registers_before[i],
+        );
+    }
+
+    let registers_after: [&[Target]; 6] = [
+        &[public_values.registers_after.program_counter],
+        &[public_values.registers_after.is_kernel],
+        &[public_values.registers_after.stack_len],
+        &public_values.registers_after.stack_top,
+        &[public_values.registers_after.context],
+        &[public_values.registers_after.gas_used],
+    ];
+    for i in 0..registers_before.len() {
+        sum = add_data_write(
+            builder,
+            challenge,
+            sum,
+            registers_segment,
+            registers_before.len() + i,
+            registers_after[i],
+        );
+    }
+
     sum
 }
 
@@ -558,37 +624,82 @@ fn add_data_write<F: RichField + Extendable<D>, const D: usize>(
         builder.assert_zero(row[4 + j]);
     }
 
-    // timestamp = 1
-    builder.assert_one(row[12]);
+    // timestamp = 2
+    let two = builder.constant(F::TWO);
+    builder.connect(row[12], two);
 
     let combined = challenge.combine_base_circuit(builder, &row);
     let inverse = builder.inverse(combined);
     builder.add(running_sum, inverse)
 }
 
-pub(crate) fn add_virtual_public_values<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn add_virtual_final_public_values_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
     builder: &mut CircuitBuilder<F, D>,
-) -> PublicValuesTarget {
-    let trie_roots_before = add_virtual_trie_roots(builder);
-    let trie_roots_after = add_virtual_trie_roots(builder);
-    let block_metadata = add_virtual_block_metadata(builder);
-    let block_hashes = add_virtual_block_hashes(builder);
-    let extra_block_data = add_virtual_extra_block_data(builder);
-    PublicValuesTarget {
-        trie_roots_before,
-        trie_roots_after,
-        block_metadata,
-        block_hashes,
-        extra_block_data,
+) -> FinalPublicValuesTarget {
+    let state_trie_root_before = builder.add_virtual_public_input_arr();
+    let state_trie_root_after = builder.add_virtual_public_input_arr();
+
+    FinalPublicValuesTarget {
+        state_trie_root_before,
+        state_trie_root_after,
     }
 }
 
-pub(crate) fn add_virtual_trie_roots<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn add_virtual_public_values_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    builder: &mut CircuitBuilder<F, D>,
+) -> PublicValuesTarget {
+    let trie_roots_before = add_virtual_trie_roots_public_input(builder);
+    let trie_roots_after = add_virtual_trie_roots_public_input(builder);
+    let burn_addr = add_virtual_burn_addr(builder);
+    let block_metadata = add_virtual_block_metadata_public_input(builder);
+    let block_hashes = add_virtual_block_hashes_public_input(builder);
+    let extra_block_data = add_virtual_extra_block_data_public_input(builder);
+    let registers_before = add_virtual_registers_data_public_input(builder);
+    let registers_after = add_virtual_registers_data_public_input(builder);
+
+    let mem_before = MemCapTarget {
+        mem_cap: MerkleCapTarget(builder.add_virtual_hashes_public_input(DEFAULT_CAP_LEN)),
+    };
+    let mem_after = MemCapTarget {
+        mem_cap: MerkleCapTarget(builder.add_virtual_hashes_public_input(DEFAULT_CAP_LEN)),
+    };
+
+    PublicValuesTarget {
+        trie_roots_before,
+        trie_roots_after,
+        burn_addr,
+        block_metadata,
+        block_hashes,
+        extra_block_data,
+        registers_before,
+        registers_after,
+        mem_before,
+        mem_after,
+    }
+}
+
+pub(crate) fn add_virtual_burn_addr<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+) -> BurnAddrTarget {
+    match cfg!(feature = "cdk_erigon") {
+        true => BurnAddrTarget::BurnAddr(builder.add_virtual_public_input_arr()),
+        false => BurnAddrTarget::Burnt(),
+    }
+}
+
+pub(crate) fn add_virtual_trie_roots_public_input<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
 ) -> TrieRootsTarget {
     let state_root = builder.add_virtual_public_input_arr();
     let transactions_root = builder.add_virtual_public_input_arr();
     let receipts_root = builder.add_virtual_public_input_arr();
+
     TrieRootsTarget {
         state_root,
         transactions_root,
@@ -596,7 +707,10 @@ pub(crate) fn add_virtual_trie_roots<F: RichField + Extendable<D>, const D: usiz
     }
 }
 
-pub(crate) fn add_virtual_block_metadata<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn add_virtual_block_metadata_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
     builder: &mut CircuitBuilder<F, D>,
 ) -> BlockMetadataTarget {
     let block_beneficiary = builder.add_virtual_public_input_arr();
@@ -612,6 +726,7 @@ pub(crate) fn add_virtual_block_metadata<F: RichField + Extendable<D>, const D: 
     let block_excess_blob_gas = builder.add_virtual_public_input_arr();
     let parent_beacon_block_root = builder.add_virtual_public_input_arr();
     let block_bloom = builder.add_virtual_public_input_arr();
+
     BlockMetadataTarget {
         block_beneficiary,
         block_timestamp,
@@ -629,17 +744,25 @@ pub(crate) fn add_virtual_block_metadata<F: RichField + Extendable<D>, const D: 
     }
 }
 
-pub(crate) fn add_virtual_block_hashes<F: RichField + Extendable<D>, const D: usize>(
+pub(crate) fn add_virtual_block_hashes_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
     builder: &mut CircuitBuilder<F, D>,
 ) -> BlockHashesTarget {
     let prev_hashes = builder.add_virtual_public_input_arr();
     let cur_hash = builder.add_virtual_public_input_arr();
+
     BlockHashesTarget {
         prev_hashes,
         cur_hash,
     }
 }
-pub(crate) fn add_virtual_extra_block_data<F: RichField + Extendable<D>, const D: usize>(
+
+pub(crate) fn add_virtual_extra_block_data_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
     builder: &mut CircuitBuilder<F, D>,
 ) -> ExtraBlockDataTarget {
     let checkpoint_state_trie_root = builder.add_virtual_public_input_arr();
@@ -647,12 +770,36 @@ pub(crate) fn add_virtual_extra_block_data<F: RichField + Extendable<D>, const D
     let txn_number_after = builder.add_virtual_public_input();
     let gas_used_before = builder.add_virtual_public_input();
     let gas_used_after = builder.add_virtual_public_input();
+
     ExtraBlockDataTarget {
         checkpoint_state_trie_root,
         txn_number_before,
         txn_number_after,
         gas_used_before,
         gas_used_after,
+    }
+}
+
+pub(crate) fn add_virtual_registers_data_public_input<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    builder: &mut CircuitBuilder<F, D>,
+) -> RegistersDataTarget {
+    let program_counter = builder.add_virtual_public_input();
+    let is_kernel = builder.add_virtual_public_input();
+    let stack_len = builder.add_virtual_public_input();
+    let stack_top = builder.add_virtual_public_input_arr();
+    let context = builder.add_virtual_public_input();
+    let gas_used = builder.add_virtual_public_input();
+
+    RegistersDataTarget {
+        program_counter,
+        is_kernel,
+        stack_len,
+        stack_top,
+        context,
+        gas_used,
     }
 }
 
@@ -704,6 +851,81 @@ where
         &public_values_target.extra_block_data,
         &public_values.extra_block_data,
     )?;
+    #[cfg(feature = "cdk_erigon")]
+    set_burn_addr_target(
+        witness,
+        &public_values_target.burn_addr,
+        public_values
+            .burn_addr
+            .expect("There should be an address set in cdk_erigon."),
+    )?;
+    set_registers_target(
+        witness,
+        &public_values_target.registers_before,
+        &public_values.registers_before,
+    )?;
+    set_registers_target(
+        witness,
+        &public_values_target.registers_after,
+        &public_values.registers_after,
+    )?;
+
+    set_mem_cap_target(
+        witness,
+        &public_values_target.mem_before,
+        &public_values.mem_before,
+    )?;
+    set_mem_cap_target(
+        witness,
+        &public_values_target.mem_after,
+        &public_values.mem_after,
+    )?;
+
+    Ok(())
+}
+
+pub fn set_final_public_value_targets<F, W, const D: usize>(
+    witness: &mut W,
+    public_values_target: &FinalPublicValuesTarget,
+    public_values: &FinalPublicValues,
+) -> Result<(), ProgramError>
+where
+    F: RichField + Extendable<D>,
+    W: Witness<F>,
+{
+    for (i, limb) in public_values
+        .state_trie_root_before
+        .into_uint()
+        .0
+        .into_iter()
+        .enumerate()
+    {
+        witness.set_target(
+            public_values_target.state_trie_root_before[2 * i],
+            F::from_canonical_u32(limb as u32),
+        );
+        witness.set_target(
+            public_values_target.state_trie_root_before[2 * i + 1],
+            F::from_canonical_u32((limb >> 32) as u32),
+        );
+    }
+
+    for (i, limb) in public_values
+        .state_trie_root_after
+        .into_uint()
+        .0
+        .into_iter()
+        .enumerate()
+    {
+        witness.set_target(
+            public_values_target.state_trie_root_after[2 * i],
+            F::from_canonical_u32(limb as u32),
+        );
+        witness.set_target(
+            public_values_target.state_trie_root_after[2 * i + 1],
+            F::from_canonical_u32((limb >> 32) as u32),
+        );
+    }
 
     Ok(())
 }
@@ -762,6 +984,27 @@ pub(crate) fn set_trie_roots_target<F, W, const D: usize>(
     }
 }
 
+#[cfg(feature = "cdk_erigon")]
+pub(crate) fn set_burn_addr_target<F, W, const D: usize>(
+    witness: &mut W,
+    burn_addr_target: &BurnAddrTarget,
+    burn_addr: U256,
+) -> Result<(), ProgramError>
+where
+    F: RichField + Extendable<D>,
+    W: Witness<F>,
+{
+    match burn_addr_target {
+        BurnAddrTarget::BurnAddr(addr_target) => {
+            let burn_addr_limbs: [F; 8] = u256_limbs::<F>(burn_addr);
+            witness.set_target_arr(addr_target, &burn_addr_limbs);
+        }
+        BurnAddrTarget::Burnt() => panic!("There should be an address target set in cdk_erigon."),
+    }
+
+    Ok(())
+}
+
 pub(crate) fn set_block_metadata_target<F, W, const D: usize>(
     witness: &mut W,
     block_metadata_target: &BlockMetadataTarget,
@@ -808,31 +1051,34 @@ where
         block_metadata_target.block_gas_used,
         u256_to_u32(block_metadata.block_gas_used)?,
     );
-    // BlobGasUsed fits in 2 limbs
-    let blob_gas_used = u256_to_u64(block_metadata.block_blob_gas_used)?;
-    witness.set_target(
-        block_metadata_target.block_blob_gas_used[0],
-        blob_gas_used.0,
-    );
-    witness.set_target(
-        block_metadata_target.block_blob_gas_used[1],
-        blob_gas_used.1,
-    );
-    // ExcessBlobGas fits in 2 limbs
-    let excess_blob_gas = u256_to_u64(block_metadata.block_excess_blob_gas)?;
-    witness.set_target(
-        block_metadata_target.block_excess_blob_gas[0],
-        excess_blob_gas.0,
-    );
-    witness.set_target(
-        block_metadata_target.block_excess_blob_gas[1],
-        excess_blob_gas.1,
-    );
+    #[cfg(feature = "eth_mainnet")]
+    {
+        // BlobGasUsed fits in 2 limbs
+        let blob_gas_used = u256_to_u64(block_metadata.block_blob_gas_used)?;
+        witness.set_target(
+            block_metadata_target.block_blob_gas_used[0],
+            blob_gas_used.0,
+        );
+        witness.set_target(
+            block_metadata_target.block_blob_gas_used[1],
+            blob_gas_used.1,
+        );
+        // ExcessBlobGas fits in 2 limbs
+        let excess_blob_gas = u256_to_u64(block_metadata.block_excess_blob_gas)?;
+        witness.set_target(
+            block_metadata_target.block_excess_blob_gas[0],
+            excess_blob_gas.0,
+        );
+        witness.set_target(
+            block_metadata_target.block_excess_blob_gas[1],
+            excess_blob_gas.1,
+        );
 
-    witness.set_target_arr(
-        &block_metadata_target.parent_beacon_block_root,
-        &h256_limbs(block_metadata.parent_beacon_block_root),
-    );
+        witness.set_target_arr(
+            &block_metadata_target.parent_beacon_block_root,
+            &h256_limbs(block_metadata.parent_beacon_block_root),
+        );
+    }
 
     let mut block_bloom_limbs = [F::ZERO; 64];
     for (i, limbs) in block_bloom_limbs.chunks_exact_mut(8).enumerate() {
@@ -886,5 +1132,44 @@ where
     witness.set_target(ed_target.gas_used_before, u256_to_u32(ed.gas_used_before)?);
     witness.set_target(ed_target.gas_used_after, u256_to_u32(ed.gas_used_after)?);
 
+    Ok(())
+}
+
+pub(crate) fn set_registers_target<F, W, const D: usize>(
+    witness: &mut W,
+    rd_target: &RegistersDataTarget,
+    rd: &RegistersData,
+) -> Result<(), ProgramError>
+where
+    F: RichField + Extendable<D>,
+    W: Witness<F>,
+{
+    witness.set_target(rd_target.program_counter, u256_to_u32(rd.program_counter)?);
+    witness.set_target(rd_target.is_kernel, u256_to_u32(rd.is_kernel)?);
+    witness.set_target(rd_target.stack_len, u256_to_u32(rd.stack_len)?);
+    witness.set_target_arr(&rd_target.stack_top, &u256_limbs(rd.stack_top));
+    witness.set_target(rd_target.context, u256_to_u32(rd.context)?);
+    witness.set_target(rd_target.gas_used, u256_to_u32(rd.gas_used)?);
+
+    Ok(())
+}
+
+pub(crate) fn set_mem_cap_target<F, W, const D: usize>(
+    witness: &mut W,
+    mc_target: &MemCapTarget,
+    mc: &MemCap,
+) -> Result<(), ProgramError>
+where
+    F: RichField + Extendable<D>,
+    W: Witness<F>,
+{
+    for i in 0..mc.mem_cap.len() {
+        witness.set_hash_target(
+            mc_target.mem_cap.0[i],
+            HashOut {
+                elements: mc.mem_cap[i].map(|elt| F::from_canonical_u64(elt.as_u64())),
+            },
+        );
+    }
     Ok(())
 }

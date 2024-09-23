@@ -2,7 +2,7 @@ use anyhow::Result;
 use ethereum_types::U256;
 use once_cell::sync::Lazy;
 use plonky2::field::goldilocks_field::GoldilocksField as F;
-use plonky2::field::types::Field;
+use plonky2::hash::hash_types::RichField;
 
 use crate::cpu::kernel::aggregator::{
     combined_kernel_from_files, KERNEL_FILES, NUMBER_KERNEL_FILES,
@@ -16,7 +16,7 @@ use crate::memory::segments::Segment;
 use crate::witness::memory::MemoryAddress;
 use crate::GenerationInputs;
 
-fn initialize_interpreter<F: Field>(interpreter: &mut Interpreter<F>, gas_limit: U256) {
+fn initialize_interpreter<F: RichField>(interpreter: &mut Interpreter<F>, gas_limit: U256) {
     let gas_limit_address = MemoryAddress {
         context: 0,
         segment: Segment::ContextMetadata.unscale(),
@@ -58,7 +58,7 @@ fn test_tstore() -> Result<()> {
         kexit_info,
     ];
 
-    let mut interpreter: Interpreter<F> = Interpreter::new(sys_tstore, initial_stack);
+    let mut interpreter: Interpreter<F> = Interpreter::new(sys_tstore, initial_stack, None);
     initialize_interpreter(&mut interpreter, 100.into());
 
     interpreter.run()?;
@@ -104,7 +104,7 @@ fn test_tstore_tload() -> Result<()> {
         kexit_info,
     ];
 
-    let mut interpreter: Interpreter<F> = Interpreter::new(sys_tstore, initial_stack);
+    let mut interpreter: Interpreter<F> = Interpreter::new(sys_tstore, initial_stack, None);
     initialize_interpreter(&mut interpreter, 200.into());
 
     interpreter.run()?;
@@ -162,7 +162,7 @@ fn test_many_tstore_many_tload() -> Result<()> {
         kexit_info,
     ];
 
-    let mut interpreter: Interpreter<F> = Interpreter::new(0, initial_stack);
+    let mut interpreter: Interpreter<F> = Interpreter::new(0, initial_stack, None);
     initialize_interpreter(&mut interpreter, (10 * 200).into());
 
     for i in 0..10 {
@@ -235,9 +235,9 @@ fn test_revert() -> Result<()> {
     });
 
     let sys_tstore = KERNEL.global_labels["sys_tstore"];
-    let mut interpreter = Interpreter::<F>::new(sys_tstore, vec![]);
+    let mut interpreter = Interpreter::<F>::new(sys_tstore, vec![], None);
     interpreter.generation_state =
-        GenerationState::<F>::new(GenerationInputs::default(), &KERNEL.code).unwrap();
+        GenerationState::<F>::new(&GenerationInputs::default(), &KERNEL.code).unwrap();
     initialize_interpreter(&mut interpreter, (20 * 100).into());
 
     // Store different values at slot 1

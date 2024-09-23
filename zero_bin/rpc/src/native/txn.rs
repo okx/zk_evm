@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use __compat_primitive_types::{H256, U256};
 use alloy::{
@@ -43,7 +43,7 @@ where
         .map(|tx| process_transaction(provider, tx))
         .collect::<FuturesOrdered<_>>()
         .try_fold(
-            (HashMap::new(), Vec::new()),
+            (BTreeSet::new(), Vec::new()),
             |(mut code_db, mut txn_infos), (tx_code_db, txn_info)| async move {
                 code_db.extend(tx_code_db);
                 txn_infos.push(txn_info);
@@ -64,23 +64,28 @@ where
     TransportT: Transport + Clone,
 {
     let (tx_receipt, pre_trace, diff_trace) = fetch_tx_data(provider, &tx.hash).await?;
+    let tx_status = tx_receipt.status();
     let tx_receipt = tx_receipt.map_inner(rlp::map_receipt_envelope);
     let access_list = parse_access_list(tx.access_list.as_ref());
 
     let tx_meta = TxnMeta {
         byte_code: <Ethereum as Network>::TxEnvelope::try_from(tx.clone())?.encoded_2718(),
-        new_txn_trie_node_byte: vec![],
         new_receipt_trie_node_byte: alloy::rlp::encode(tx_receipt.inner),
         gas_used: tx_receipt.gas_used as u64,
     };
 
-    let (code_db, tx_traces) = match (pre_trace, diff_trace) {
+    let (code_db, mut tx_traces) = match (pre_trace, diff_trace) {
         (
             GethTrace::PreStateTracer(PreStateFrame::Default(read)),
             GethTrace::PreStateTracer(PreStateFrame::Diff(diff)),
         ) => process_tx_traces(access_list, read, diff).await?,
         _ => unreachable!(),
     };
+
+    // Handle case when transaction failed and a contract creation was reverted
+    if !tx_status && tx_receipt.contract_address.is_some() {
+        tx_traces.insert(tx_receipt.contract_address.unwrap(), TxnTrace::default());
+    }
 
     Ok((
         code_db,
@@ -138,7 +143,7 @@ async fn process_tx_traces(
     mut access_list: HashMap<Address, HashSet<H256>>,
     read_trace: PreStateMode,
     diff_trace: DiffMode,
-) -> anyhow::Result<(CodeDb, HashMap<Address, TxnTrace>)> {
+) -> anyhow::Result<(CodeDb, BTreeMap<Address, TxnTrace>)> {
     let DiffMode {
         pre: pre_trace,
         post: post_trace,
@@ -153,8 +158,8 @@ async fn process_tx_traces(
         .copied()
         .collect();
 
-    let mut traces = HashMap::new();
-    let mut code_db: CodeDb = HashMap::new();
+    let mut traces = BTreeMap::new();
+    let mut code_db: CodeDb = BTreeSet::new();
 
     for address in addresses {
         let read_state = read_trace.0.get(&address);
@@ -170,6 +175,7 @@ async fn process_tx_traces(
         );
         let code = process_code(post_state, read_state, &mut code_db).await;
         let nonce = process_nonce(post_state, &code);
+        let self_destructed = process_self_destruct(post_state, pre_state);
 
         let result = TxnTrace {
             balance,
@@ -177,6 +183,7 @@ async fn process_tx_traces(
             storage_read,
             storage_written,
             code_usage: code,
+            self_destructed,
         };
 
         traces.insert(address, result);
@@ -203,6 +210,30 @@ fn process_nonce(
         })
 }
 
+/// Processes the self destruct for the given account state.
+/// This wraps the actual boolean indicator into an `Option` so that we can skip
+/// serialization of `None` values, which represent most cases.
+fn process_self_destruct(
+    post_state: Option<&AccountState>,
+    pre_state: Option<&AccountState>,
+) -> bool {
+    if post_state.is_none() {
+        // EIP-6780:
+        // A contract is considered created at the beginning of a create
+        // transaction or when a CREATE series operation begins execution (CREATE,
+        // CREATE2, and other operations that deploy contracts in the future). If a
+        // balance exists at the contract’s new address it is still considered to be a
+        // contract creation.
+        if let Some(acc) = pre_state {
+            if acc.code.is_none() && acc.storage.keys().collect::<Vec<_>>().is_empty() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Processes the storage for the given account state.
 ///
 /// Returns the storage read and written for the given account in the
@@ -212,21 +243,15 @@ fn process_storage(
     acct_state: Option<&AccountState>,
     post_acct: Option<&AccountState>,
     pre_acct: Option<&AccountState>,
-) -> (Option<Vec<H256>>, Option<HashMap<H256, U256>>) {
-    let mut storage_read = access_list;
+) -> (BTreeSet<H256>, BTreeMap<H256, U256>) {
+    let mut storage_read = BTreeSet::from_iter(access_list);
     storage_read.extend(
         acct_state
-            .map(|acct| {
-                acct.storage
-                    .keys()
-                    .copied()
-                    .map(Compat::compat)
-                    .collect::<Vec<H256>>()
-            })
-            .unwrap_or_default(),
+            .into_iter()
+            .flat_map(|acct| acct.storage.keys().copied().map(Compat::compat)),
     );
 
-    let mut storage_written: HashMap<H256, U256> = post_acct
+    let mut storage_written: BTreeMap<H256, U256> = post_acct
         .map(|x| {
             x.storage
                 .iter()
@@ -238,16 +263,11 @@ fn process_storage(
     // Add the deleted keys to the storage written
     if let Some(pre_acct) = pre_acct {
         for key in pre_acct.storage.keys() {
-            storage_written
-                .entry((*key).compat())
-                .or_insert(U256::zero());
+            storage_written.entry((*key).compat()).or_default();
         }
     };
 
-    (
-        Option::from(storage_read.into_iter().collect::<Vec<H256>>()).filter(|v| !v.is_empty()),
-        Option::from(storage_written).filter(|v| !v.is_empty()),
-    )
+    (storage_read, storage_written)
 }
 
 /// Processes the code usage for the given account state.
@@ -261,14 +281,12 @@ async fn process_code(
         read_state.and_then(|x| x.code.as_ref()),
     ) {
         (Some(post_code), _) => {
-            let code_hash = keccak256(post_code).compat();
-            code_db.insert(code_hash, post_code.to_vec());
+            code_db.insert(post_code.to_vec());
             Some(ContractCodeUsage::Write(post_code.to_vec()))
         }
         (_, Some(read_code)) => {
             let code_hash = keccak256(read_code).compat();
-            code_db.insert(code_hash, read_code.to_vec());
-
+            code_db.insert(read_code.to_vec());
             Some(ContractCodeUsage::Read(code_hash))
         }
         _ => None,

@@ -12,7 +12,7 @@ use plonky2::field::extension::Extendable;
 use plonky2::fri::FriParams;
 use plonky2::gates::constant::ConstantGate;
 use plonky2::gates::noop::NoopGate;
-use plonky2::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
+use plonky2::hash::hash_types::{MerkleCapTarget, RichField, NUM_HASH_OUT_ELTS};
 use plonky2::iop::challenger::RecursiveChallenger;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
@@ -36,23 +36,41 @@ use starky::proof::StarkProofWithMetadata;
 use starky::stark::Stark;
 
 use crate::all_stark::{all_cross_table_lookups, AllStark, Table, NUM_TABLES};
-use crate::generation::GenerationInputs;
+use crate::cpu::kernel::aggregator::KERNEL;
+use crate::generation::segments::{GenerationSegmentData, SegmentDataIterator, SegmentError};
+use crate::generation::{GenerationInputs, TrimmedGenerationInputs};
 use crate::get_challenges::observe_public_values_target;
 use crate::proof::{
-    AllProof, BlockHashesTarget, BlockMetadataTarget, ExtraBlockData, ExtraBlockDataTarget,
-    PublicValues, PublicValuesTarget, TrieRoots, TrieRootsTarget,
+    AllProof, BlockHashesTarget, BlockMetadataTarget, BurnAddrTarget, ExtraBlockData,
+    ExtraBlockDataTarget, FinalPublicValues, FinalPublicValuesTarget, MemCapTarget, PublicValues,
+    PublicValuesTarget, RegistersDataTarget, TrieRoots, TrieRootsTarget, DEFAULT_CAP_LEN,
+    TARGET_HASH_SIZE,
 };
-use crate::prover::{check_abort_signal, prove};
+use crate::prover::{check_abort_signal, features_check, prove};
 use crate::recursive_verifier::{
-    add_common_recursion_gates, add_virtual_public_values, get_memory_extra_looking_sum_circuit,
-    recursive_stark_circuit, set_public_value_targets, PlonkWrapperCircuit, PublicInputs,
-    StarkWrapperCircuit,
+    add_common_recursion_gates, add_virtual_final_public_values_public_input,
+    add_virtual_public_values_public_input, get_memory_extra_looking_sum_circuit,
+    recursive_stark_circuit, set_final_public_value_targets, set_public_value_targets,
+    PlonkWrapperCircuit, PublicInputs, StarkWrapperCircuit,
 };
 use crate::util::h256_limbs;
+use crate::verifier::initial_memory_merkle_cap;
 
 /// The recursion threshold. We end a chain of recursive proofs once we reach
 /// this size.
 const THRESHOLD_DEGREE_BITS: usize = 13;
+
+#[derive(Clone)]
+pub struct ProverOutputData<F, C, const D: usize>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    C::Hasher: AlgebraicHasher<F>,
+{
+    pub is_dummy: bool,
+    pub proof_with_pis: ProofWithPublicInputs<F, C, D>,
+    pub public_values: PublicValues,
+}
 
 /// Contains all recursive circuits used in the system. For each STARK and each
 /// initial `degree_bits`, this contains a chain of recursive circuits for
@@ -69,12 +87,19 @@ where
     /// The EVM root circuit, which aggregates the (shrunk) per-table recursive
     /// proofs.
     pub root: RootCircuitData<F, C, D>,
-    /// The aggregation circuit, which verifies two proofs that can either be
-    /// root or aggregation proofs.
-    pub aggregation: AggregationCircuitData<F, C, D>,
-    /// The block circuit, which verifies an aggregation root proof and an
+    /// The segment aggregation circuit, which verifies that two segment proofs
+    /// that can either be root or aggregation proofs.
+    pub segment_aggregation: SegmentAggregationCircuitData<F, C, D>,
+    /// The transaction aggregation circuit, which verifies the aggregation of
+    /// two proofs that can either be a segment aggregation representing a
+    /// batch of transactions or an aggregation of those batches.
+    pub txn_aggregation: TxnAggregationCircuitData<F, C, D>,
+    /// The block circuit, which verifies a transaction aggregation proof and an
     /// optional previous block proof.
     pub block: BlockCircuitData<F, C, D>,
+    /// A single wrapping layer on top of a block proof for easy aggregation
+    /// with additional block proofs from other chains.
+    pub block_wrapper: BlockWrapperCircuitData<F, C, D>,
     /// The two-to-one block aggregation circuit, which verifies two unrelated
     /// block proofs.
     pub two_to_one_block: TwoToOneBlockCircuitData<F, C, D>,
@@ -155,11 +180,109 @@ where
     }
 }
 
-/// Data for the aggregation circuit, which is used to compress two proofs into
-/// one. Each inner proof can be either an EVM root proof or another aggregation
-/// proof.
+/// Data for the segment aggregation circuit, which is used to compress two
+/// segment proofs into one. Each inner proof can be either an EVM root proof or
+/// another segment aggregation proof.
 #[derive(Eq, PartialEq, Debug)]
-pub struct AggregationCircuitData<F, C, const D: usize>
+pub struct SegmentAggregationCircuitData<F, C, const D: usize>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    pub circuit: CircuitData<F, C, D>,
+    lhs: AggregationChildTarget<D>,
+    rhs: AggregationChildWithDummyTarget<D>,
+    public_values: PublicValuesTarget,
+    cyclic_vk: VerifierCircuitTarget,
+}
+
+impl<F, C, const D: usize> SegmentAggregationCircuitData<F, C, D>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    fn to_buffer(
+        &self,
+        buffer: &mut Vec<u8>,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<()> {
+        buffer.write_circuit_data(&self.circuit, gate_serializer, generator_serializer)?;
+        buffer.write_target_verifier_circuit(&self.cyclic_vk)?;
+        self.public_values.to_buffer(buffer)?;
+        self.lhs.to_buffer(buffer)?;
+        self.rhs.to_buffer(buffer)?;
+        Ok(())
+    }
+
+    fn from_buffer(
+        buffer: &mut Buffer,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<Self> {
+        let circuit = buffer.read_circuit_data(gate_serializer, generator_serializer)?;
+        let cyclic_vk = buffer.read_target_verifier_circuit()?;
+        let public_values = PublicValuesTarget::from_buffer(buffer)?;
+        let lhs = AggregationChildTarget::from_buffer(buffer)?;
+        let rhs = AggregationChildWithDummyTarget::from_buffer(buffer)?;
+        Ok(Self {
+            circuit,
+            lhs,
+            rhs,
+            public_values,
+            cyclic_vk,
+        })
+    }
+}
+
+#[derive(Eq, PartialEq, Debug)]
+struct AggregationChildWithDummyTarget<const D: usize> {
+    is_agg: BoolTarget,
+    is_dummy: BoolTarget,
+    agg_proof: ProofWithPublicInputsTarget<D>,
+    real_proof: ProofWithPublicInputsTarget<D>,
+}
+
+impl<const D: usize> AggregationChildWithDummyTarget<D> {
+    fn to_buffer(&self, buffer: &mut Vec<u8>) -> IoResult<()> {
+        buffer.write_target_bool(self.is_agg)?;
+        buffer.write_target_bool(self.is_dummy)?;
+        buffer.write_target_proof_with_public_inputs(&self.agg_proof)?;
+        buffer.write_target_proof_with_public_inputs(&self.real_proof)?;
+        Ok(())
+    }
+
+    fn from_buffer(buffer: &mut Buffer) -> IoResult<Self> {
+        let is_agg = buffer.read_target_bool()?;
+        let is_dummy = buffer.read_target_bool()?;
+        let agg_proof = buffer.read_target_proof_with_public_inputs()?;
+        let real_proof = buffer.read_target_proof_with_public_inputs()?;
+        Ok(Self {
+            is_agg,
+            is_dummy,
+            agg_proof,
+            real_proof,
+        })
+    }
+
+    // `len_mem_cap` is the length of the Merkle
+    // caps for `MemBefore` and `MemAfter`.
+    fn public_values<F: RichField + Extendable<D>>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> PublicValuesTarget {
+        let agg_pv = PublicValuesTarget::from_public_inputs(&self.agg_proof.public_inputs);
+        let segment_pv = PublicValuesTarget::from_public_inputs(&self.real_proof.public_inputs);
+
+        PublicValuesTarget::select(builder, self.is_agg, agg_pv, segment_pv)
+    }
+}
+
+/// Data for the transaction aggregation circuit, which is used to compress two
+/// proofs into one. Each inner proof can be either a segment aggregation proof
+/// or another transaction aggregation proof.
+#[derive(Eq, PartialEq, Debug)]
+pub struct TxnAggregationCircuitData<F, C, const D: usize>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -171,7 +294,7 @@ where
     cyclic_vk: VerifierCircuitTarget,
 }
 
-impl<F, C, const D: usize> AggregationCircuitData<F, C, D>
+impl<F, C, const D: usize> TxnAggregationCircuitData<F, C, D>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -316,6 +439,56 @@ where
     }
 }
 
+/// Data for the block wrapper circuit, which is used to generate a wrapped
+/// final block proof and obfuscate the remaining private elements of a chain.
+#[derive(Eq, PartialEq, Debug)]
+pub struct BlockWrapperCircuitData<F, C, const D: usize>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    pub circuit: CircuitData<F, C, D>,
+    parent_block_proof: ProofWithPublicInputsTarget<D>,
+    public_values: FinalPublicValuesTarget,
+    cyclic_vk: VerifierCircuitTarget,
+}
+
+impl<F, C, const D: usize> BlockWrapperCircuitData<F, C, D>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+{
+    fn to_buffer(
+        &self,
+        buffer: &mut Vec<u8>,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<()> {
+        buffer.write_circuit_data(&self.circuit, gate_serializer, generator_serializer)?;
+        buffer.write_target_proof_with_public_inputs(&self.parent_block_proof)?;
+        buffer.write_target_verifier_circuit(&self.cyclic_vk)?;
+        self.public_values.to_buffer(buffer)
+    }
+
+    fn from_buffer(
+        buffer: &mut Buffer,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<Self> {
+        let circuit = buffer.read_circuit_data(gate_serializer, generator_serializer)?;
+        let parent_block_proof = buffer.read_target_proof_with_public_inputs()?;
+        let cyclic_vk = buffer.read_target_verifier_circuit()?;
+        let public_values = FinalPublicValuesTarget::from_buffer(buffer)?;
+
+        Ok(Self {
+            circuit,
+            parent_block_proof,
+            public_values,
+            cyclic_vk,
+        })
+    }
+}
+
 /// Data for the two-to-one block circuit, which is used to generate a
 /// proof of two unrelated proofs.
 #[derive(Eq, PartialEq, Debug)]
@@ -394,9 +567,13 @@ where
         let mut buffer = Vec::with_capacity(1 << 34);
         self.root
             .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
-        self.aggregation
+        self.segment_aggregation
+            .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
+        self.txn_aggregation
             .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
         self.block
+            .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
+        self.block_wrapper
             .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
         self.two_to_one_block
             .to_buffer(&mut buffer, gate_serializer, generator_serializer)?;
@@ -430,13 +607,23 @@ where
         let mut buffer = Buffer::new(bytes);
         let root =
             RootCircuitData::from_buffer(&mut buffer, gate_serializer, generator_serializer)?;
-        let aggregation = AggregationCircuitData::from_buffer(
+        let segment_aggregation = SegmentAggregationCircuitData::from_buffer(
+            &mut buffer,
+            gate_serializer,
+            generator_serializer,
+        )?;
+        let txn_aggregation = TxnAggregationCircuitData::from_buffer(
             &mut buffer,
             gate_serializer,
             generator_serializer,
         )?;
         let block =
             BlockCircuitData::from_buffer(&mut buffer, gate_serializer, generator_serializer)?;
+        let block_wrapper = BlockWrapperCircuitData::from_buffer(
+            &mut buffer,
+            gate_serializer,
+            generator_serializer,
+        )?;
         let two_to_one_block = TwoToOneBlockCircuitData::from_buffer(
             &mut buffer,
             gate_serializer,
@@ -475,8 +662,10 @@ where
 
         Ok(Self {
             root,
-            aggregation,
+            segment_aggregation,
+            txn_aggregation,
             block,
+            block_wrapper,
             two_to_one_block,
             by_table,
         })
@@ -505,6 +694,9 @@ where
         degree_bits_ranges: &[Range<usize>; NUM_TABLES],
         stark_config: &StarkConfig,
     ) -> Self {
+        // Sanity check on the provided config
+        assert_eq!(DEFAULT_CAP_LEN, 1 << stark_config.fri_config.cap_height);
+
         let arithmetic = RecursiveCircuitsForTable::new(
             Table::Arithmetic,
             &all_stark.arithmetic_stark,
@@ -554,6 +746,28 @@ where
             &all_stark.cross_table_lookups,
             stark_config,
         );
+        let mem_before = RecursiveCircuitsForTable::new(
+            Table::MemBefore,
+            &all_stark.mem_before_stark,
+            degree_bits_ranges[*Table::MemBefore].clone(),
+            &all_stark.cross_table_lookups,
+            stark_config,
+        );
+        let mem_after = RecursiveCircuitsForTable::new(
+            Table::MemAfter,
+            &all_stark.mem_after_stark,
+            degree_bits_ranges[*Table::MemAfter].clone(),
+            &all_stark.cross_table_lookups,
+            stark_config,
+        );
+        #[cfg(feature = "cdk_erigon")]
+        let poseidon = RecursiveCircuitsForTable::new(
+            Table::Poseidon,
+            &all_stark.poseidon_stark,
+            degree_bits_ranges[*Table::Poseidon].clone(),
+            &all_stark.cross_table_lookups,
+            stark_config,
+        );
 
         let by_table = [
             arithmetic,
@@ -563,16 +777,24 @@ where
             keccak_sponge,
             logic,
             memory,
+            mem_before,
+            mem_after,
+            #[cfg(feature = "cdk_erigon")]
+            poseidon,
         ];
-        let root = Self::create_root_circuit(&by_table, stark_config);
-        let aggregation = Self::create_aggregation_circuit(&root);
-        let block = Self::create_block_circuit(&aggregation);
-        let two_to_one_block = Self::create_two_to_one_block_circuit(&block);
-
+        let root = Self::create_segment_circuit(&by_table, stark_config);
+        let segment_aggregation = Self::create_segment_aggregation_circuit(&root);
+        let txn_aggregation =
+            Self::create_txn_aggregation_circuit(&segment_aggregation, stark_config);
+        let block = Self::create_block_circuit(&txn_aggregation);
+        let block_wrapper = Self::create_block_wrapper_circuit(&block);
+        let two_to_one_block = Self::create_two_to_one_block_circuit(&block_wrapper);
         Self {
             root,
-            aggregation,
+            segment_aggregation,
+            txn_aggregation,
             block,
+            block_wrapper,
             two_to_one_block,
             by_table,
         }
@@ -598,7 +820,7 @@ where
         self.block.circuit.verifier_data()
     }
 
-    fn create_root_circuit(
+    fn create_segment_circuit(
         by_table: &[RecursiveCircuitsForTable<F, C, D>; NUM_TABLES],
         stark_config: &StarkConfig,
     ) -> RootCircuitData<F, C, D> {
@@ -607,7 +829,7 @@ where
 
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
 
-        let public_values = add_virtual_public_values(&mut builder);
+        let public_values = add_virtual_public_values_public_input(&mut builder);
 
         let recursive_proofs =
             core::array::from_fn(|i| builder.add_virtual_proof_with_pis(inner_common_data[i]));
@@ -713,6 +935,18 @@ where
             );
         }
 
+        let merkle_before =
+            MemCapTarget::from_public_inputs(&recursive_proofs[*Table::MemBefore].public_inputs);
+        let merkle_after =
+            MemCapTarget::from_public_inputs(&recursive_proofs[*Table::MemAfter].public_inputs);
+        // Connect Memory before and after the execution with
+        // the public values.
+        MemCapTarget::connect(
+            &mut builder,
+            public_values.mem_before.clone(),
+            merkle_before,
+        );
+        MemCapTarget::connect(&mut builder, public_values.mem_after.clone(), merkle_after);
         // We want EVM root proofs to have the exact same structure as aggregation
         // proofs, so we add public inputs for cyclic verification, even though
         // they'll be ignored.
@@ -732,64 +966,160 @@ where
         }
     }
 
-    fn create_aggregation_circuit(
+    fn create_segment_aggregation_circuit(
         root: &RootCircuitData<F, C, D>,
-    ) -> AggregationCircuitData<F, C, D> {
+    ) -> SegmentAggregationCircuitData<F, C, D> {
         let mut builder = CircuitBuilder::<F, D>::new(root.circuit.common.config.clone());
-        let public_values = add_virtual_public_values(&mut builder);
+        let public_values = add_virtual_public_values_public_input(&mut builder);
         let cyclic_vk = builder.add_verifier_data_public_inputs();
 
-        let lhs = Self::add_agg_child(&mut builder, &root.circuit);
-        let rhs = Self::add_agg_child(&mut builder, &root.circuit);
+        // The right hand side child might be dummy.
+        let lhs_segment = Self::add_segment_agg_child(&mut builder, root);
+        let rhs_segment = Self::add_segment_agg_child_with_dummy(
+            &mut builder,
+            root,
+            lhs_segment.base_proof.clone(),
+        );
 
-        let lhs_public_values = lhs.public_values(&mut builder);
-        let rhs_public_values = rhs.public_values(&mut builder);
-        // Connect all block hash values
-        BlockHashesTarget::connect(
-            &mut builder,
-            public_values.block_hashes,
-            lhs_public_values.block_hashes,
-        );
-        BlockHashesTarget::connect(
-            &mut builder,
-            public_values.block_hashes,
-            rhs_public_values.block_hashes,
-        );
-        // Connect all block metadata values.
-        BlockMetadataTarget::connect(
-            &mut builder,
-            public_values.block_metadata,
-            lhs_public_values.block_metadata,
-        );
-        BlockMetadataTarget::connect(
-            &mut builder,
-            public_values.block_metadata,
-            rhs_public_values.block_metadata,
-        );
-        // Connect aggregation `trie_roots_before` with lhs `trie_roots_before`.
+        let lhs_pv = lhs_segment.public_values(&mut builder);
+        let rhs_pv = rhs_segment.public_values(&mut builder);
+
+        let is_dummy = rhs_segment.is_dummy;
+        let one = builder.one();
+        let is_not_dummy = builder.sub(one, is_dummy.target);
+        let is_not_dummy = BoolTarget::new_unsafe(is_not_dummy);
+
+        // Always connect the lhs to the aggregation public values.
         TrieRootsTarget::connect(
             &mut builder,
             public_values.trie_roots_before,
-            lhs_public_values.trie_roots_before,
+            lhs_pv.trie_roots_before,
         );
-        // Connect aggregation `trie_roots_after` with rhs `trie_roots_after`.
         TrieRootsTarget::connect(
             &mut builder,
             public_values.trie_roots_after,
-            rhs_public_values.trie_roots_after,
+            lhs_pv.trie_roots_after,
         );
-        // Connect lhs `trie_roots_after` with rhs `trie_roots_before`.
-        TrieRootsTarget::connect(
+        BlockMetadataTarget::connect(
             &mut builder,
-            lhs_public_values.trie_roots_after,
-            rhs_public_values.trie_roots_before,
+            public_values.block_metadata,
+            lhs_pv.block_metadata,
+        );
+        BlockHashesTarget::connect(
+            &mut builder,
+            public_values.block_hashes,
+            lhs_pv.block_hashes,
+        );
+        ExtraBlockDataTarget::connect(
+            &mut builder,
+            public_values.extra_block_data,
+            lhs_pv.extra_block_data,
+        );
+        RegistersDataTarget::connect(
+            &mut builder,
+            public_values.registers_before.clone(),
+            lhs_pv.registers_before.clone(),
+        );
+        MemCapTarget::connect(
+            &mut builder,
+            public_values.mem_before.clone(),
+            lhs_pv.mem_before.clone(),
         );
 
-        Self::connect_extra_public_values(
+        // If the rhs is a real proof, all the block metadata must be the same for both
+        // segments. It is also the case for the extra block data.
+        TrieRootsTarget::conditional_assert_eq(
             &mut builder,
-            &public_values.extra_block_data,
-            &lhs_public_values.extra_block_data,
-            &rhs_public_values.extra_block_data,
+            is_not_dummy,
+            public_values.trie_roots_before,
+            rhs_pv.trie_roots_before,
+        );
+        TrieRootsTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.trie_roots_after,
+            rhs_pv.trie_roots_after,
+        );
+
+        // Connect the burn address targets.
+        #[cfg(feature = "cdk_erigon")]
+        {
+            BurnAddrTarget::conditional_assert_eq(
+                &mut builder,
+                is_not_dummy,
+                lhs_pv.burn_addr,
+                rhs_pv.burn_addr.clone(),
+            );
+            BurnAddrTarget::conditional_assert_eq(
+                &mut builder,
+                is_not_dummy,
+                public_values.burn_addr.clone(),
+                rhs_pv.burn_addr,
+            );
+        }
+
+        BlockMetadataTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.block_metadata,
+            rhs_pv.block_metadata,
+        );
+        BlockHashesTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.block_hashes,
+            rhs_pv.block_hashes,
+        );
+        ExtraBlockDataTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.extra_block_data,
+            rhs_pv.extra_block_data,
+        );
+
+        // If the rhs is a real proof: Connect registers and merkle caps between
+        // segments.
+        RegistersDataTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.registers_after.clone(),
+            rhs_pv.registers_after.clone(),
+        );
+        RegistersDataTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            lhs_pv.registers_after.clone(),
+            rhs_pv.registers_before.clone(),
+        );
+        MemCapTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            public_values.mem_after.clone(),
+            rhs_pv.mem_after.clone(),
+        );
+        MemCapTarget::conditional_assert_eq(
+            &mut builder,
+            is_not_dummy,
+            lhs_pv.mem_after.clone(),
+            rhs_pv.mem_before.clone(),
+        );
+
+        // If the rhs is a dummy, then the lhs must be a segment.
+        let constr = builder.mul(is_dummy.target, lhs_segment.is_agg.target);
+        builder.assert_zero(constr);
+
+        // If the rhs is a dummy, then the aggregation PVs are equal to the lhs PVs.
+        MemCapTarget::conditional_assert_eq(
+            &mut builder,
+            is_dummy,
+            public_values.mem_after.clone(),
+            lhs_pv.mem_after,
+        );
+        RegistersDataTarget::conditional_assert_eq(
+            &mut builder,
+            is_dummy,
+            public_values.registers_after.clone(),
+            lhs_pv.registers_after,
         );
 
         // Pad to match the root circuit's degree.
@@ -798,10 +1128,296 @@ where
         }
 
         let circuit = builder.build::<C>();
-        AggregationCircuitData {
+        SegmentAggregationCircuitData {
             circuit,
-            lhs,
-            rhs,
+            lhs: lhs_segment,
+            rhs: rhs_segment,
+            public_values,
+            cyclic_vk,
+        }
+    }
+
+    fn create_txn_aggregation_circuit(
+        agg: &SegmentAggregationCircuitData<F, C, D>,
+        stark_config: &StarkConfig,
+    ) -> TxnAggregationCircuitData<F, C, D> {
+        // Create a circuit for the aggregation of two transactions.
+
+        let mut builder = CircuitBuilder::<F, D>::new(agg.circuit.common.config.clone());
+        let public_values = add_virtual_public_values_public_input(&mut builder);
+        let cyclic_vk = builder.add_verifier_data_public_inputs();
+
+        let lhs_txn_proof = Self::add_txn_agg_child(&mut builder, agg);
+        let rhs_txn_proof = Self::add_txn_agg_child(&mut builder, agg);
+
+        let lhs_pv = lhs_txn_proof.public_values(&mut builder);
+        let rhs_pv = rhs_txn_proof.public_values(&mut builder);
+
+        // Connect all block hash values
+        BlockHashesTarget::connect(
+            &mut builder,
+            public_values.block_hashes,
+            rhs_pv.block_hashes,
+        );
+        BlockHashesTarget::connect(
+            &mut builder,
+            public_values.block_hashes,
+            lhs_pv.block_hashes,
+        );
+        // Connect all block metadata values.
+        BlockMetadataTarget::connect(
+            &mut builder,
+            public_values.block_metadata,
+            rhs_pv.block_metadata,
+        );
+        BlockMetadataTarget::connect(
+            &mut builder,
+            public_values.block_metadata,
+            lhs_pv.block_metadata,
+        );
+        // Connect aggregation `trie_roots_after` with rhs `trie_roots_after`.
+        TrieRootsTarget::connect(
+            &mut builder,
+            public_values.trie_roots_after,
+            rhs_pv.trie_roots_after,
+        );
+        // Connect lhs `trie_roots_after` with rhs `trie_roots_before`.
+        TrieRootsTarget::connect(
+            &mut builder,
+            lhs_pv.trie_roots_after,
+            rhs_pv.trie_roots_before,
+        );
+        // Connect lhs `trie_roots_before` with public values `trie_roots_before`.
+        TrieRootsTarget::connect(
+            &mut builder,
+            public_values.trie_roots_before,
+            lhs_pv.trie_roots_before,
+        );
+
+        // Connect the burn address targets.
+        #[cfg(feature = "cdk_erigon")]
+        {
+            BurnAddrTarget::connect(
+                &mut builder,
+                lhs_pv.burn_addr.clone(),
+                rhs_pv.burn_addr.clone(),
+            );
+            BurnAddrTarget::connect(
+                &mut builder,
+                public_values.burn_addr.clone(),
+                rhs_pv.burn_addr.clone(),
+            );
+        }
+
+        Self::connect_extra_public_values(
+            &mut builder,
+            &public_values.extra_block_data,
+            &lhs_pv.extra_block_data,
+            &rhs_pv.extra_block_data,
+        );
+
+        // We check the registers before and after for the current aggregation.
+        RegistersDataTarget::connect(
+            &mut builder,
+            public_values.registers_after.clone(),
+            rhs_pv.registers_after.clone(),
+        );
+
+        RegistersDataTarget::connect(
+            &mut builder,
+            public_values.registers_before.clone(),
+            lhs_pv.registers_before.clone(),
+        );
+
+        // Check the initial and final register values.
+        Self::connect_initial_final_segment(&mut builder, &rhs_pv);
+        Self::connect_initial_final_segment(&mut builder, &lhs_pv);
+
+        // Check the initial `MemBefore` `MerkleCap` value.
+        Self::check_init_merkle_cap(&mut builder, &rhs_pv, stark_config);
+        Self::check_init_merkle_cap(&mut builder, &lhs_pv, stark_config);
+
+        while log2_ceil(builder.num_gates()) < agg.circuit.common.degree_bits() {
+            builder.add_gate(NoopGate, vec![]);
+        }
+
+        let circuit = builder.build::<C>();
+        TxnAggregationCircuitData {
+            circuit,
+            lhs: lhs_txn_proof,
+            rhs: rhs_txn_proof,
+            public_values,
+            cyclic_vk,
+        }
+    }
+
+    /// Extend a circuit to verify one of two proofs.
+    ///
+    /// # Arguments
+    ///
+    /// - `builder`: The circuit builder object.
+    /// - `base_circuit`: Circuit data describing the circuit of the base proof.
+    ///
+    /// # Outputs
+    ///
+    /// Returns a [`TwoToOneBlockChildTarget<D>`] object.
+    fn add_agg_child(
+        builder: &mut CircuitBuilder<F, D>,
+        base_circuit: &CircuitData<F, C, D>,
+    ) -> AggregationChildTarget<D> {
+        let common = &base_circuit.common;
+        let base_vk = builder.constant_verifier_data(&base_circuit.verifier_only);
+        let is_agg = builder.add_virtual_bool_target_safe();
+        let agg_proof = builder.add_virtual_proof_with_pis(common);
+        let base_proof = builder.add_virtual_proof_with_pis(common);
+        builder
+            .conditionally_verify_cyclic_proof::<C>(
+                is_agg,
+                &agg_proof,
+                &base_proof,
+                &base_vk,
+                common,
+            )
+            .expect("Failed to build cyclic recursion circuit");
+        AggregationChildTarget {
+            is_agg,
+            agg_proof,
+            base_proof,
+        }
+    }
+
+    fn check_init_merkle_cap(
+        builder: &mut CircuitBuilder<F, D>,
+        x: &PublicValuesTarget,
+        stark_config: &StarkConfig,
+    ) where
+        F: RichField + Extendable<D>,
+    {
+        let cap = initial_memory_merkle_cap::<F, C, D>(
+            stark_config.fri_config.rate_bits,
+            stark_config.fri_config.cap_height,
+        );
+
+        let init_cap_target = MemCapTarget {
+            mem_cap: MerkleCapTarget(
+                cap.0
+                    .iter()
+                    .map(|&h| builder.constant_hash(h))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+
+        MemCapTarget::connect(builder, x.mem_before.clone(), init_cap_target);
+    }
+
+    fn connect_initial_final_segment(builder: &mut CircuitBuilder<F, D>, x: &PublicValuesTarget)
+    where
+        F: RichField + Extendable<D>,
+    {
+        builder.assert_zero(x.registers_before.stack_len);
+        builder.assert_zero(x.registers_after.stack_len);
+        builder.assert_zero(x.registers_before.context);
+        builder.assert_zero(x.registers_after.context);
+        builder.assert_zero(x.registers_before.gas_used);
+        builder.assert_one(x.registers_before.is_kernel);
+        builder.assert_one(x.registers_after.is_kernel);
+
+        let halt_label = builder.constant(F::from_canonical_usize(KERNEL.global_labels["halt"]));
+        builder.connect(x.registers_after.program_counter, halt_label);
+
+        let main_label = builder.constant(F::from_canonical_usize(KERNEL.global_labels["main"]));
+        builder.connect(x.registers_before.program_counter, main_label);
+    }
+
+    fn create_block_circuit(agg: &TxnAggregationCircuitData<F, C, D>) -> BlockCircuitData<F, C, D> {
+        // Here, we have two block proofs and we aggregate them together.
+        // The block circuit is similar to the agg circuit; both verify two inner
+        // proofs.
+        let expected_common_data = CommonCircuitData {
+            fri_params: FriParams {
+                degree_bits: 14,
+                ..agg.circuit.common.fri_params.clone()
+            },
+            ..agg.circuit.common.clone()
+        };
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let public_values = add_virtual_public_values_public_input(&mut builder);
+        let has_parent_block = builder.add_virtual_bool_target_safe();
+        let parent_block_proof = builder.add_virtual_proof_with_pis(&expected_common_data);
+        let agg_root_proof = builder.add_virtual_proof_with_pis(&agg.circuit.common);
+
+        // Connect block hashes
+        Self::connect_block_hashes(&mut builder, &parent_block_proof, &agg_root_proof);
+
+        let parent_pv = PublicValuesTarget::from_public_inputs(&parent_block_proof.public_inputs);
+        let agg_pv = PublicValuesTarget::from_public_inputs(&agg_root_proof.public_inputs);
+
+        // Connect block `trie_roots_before` with parent_pv `trie_roots_before`.
+        TrieRootsTarget::connect(
+            &mut builder,
+            public_values.trie_roots_before,
+            parent_pv.trie_roots_before,
+        );
+        // Connect the rest of block `public_values` with agg_pv.
+        TrieRootsTarget::connect(
+            &mut builder,
+            public_values.trie_roots_after,
+            agg_pv.trie_roots_after,
+        );
+        BlockMetadataTarget::connect(
+            &mut builder,
+            public_values.block_metadata,
+            agg_pv.block_metadata,
+        );
+        BlockHashesTarget::connect(
+            &mut builder,
+            public_values.block_hashes,
+            agg_pv.block_hashes,
+        );
+        ExtraBlockDataTarget::connect(
+            &mut builder,
+            public_values.extra_block_data,
+            agg_pv.extra_block_data,
+        );
+
+        // Connect the burn address targets.
+        #[cfg(feature = "cdk_erigon")]
+        {
+            BurnAddrTarget::connect(
+                &mut builder,
+                parent_pv.burn_addr.clone(),
+                agg_pv.burn_addr.clone(),
+            );
+            BurnAddrTarget::connect(
+                &mut builder,
+                public_values.burn_addr.clone(),
+                agg_pv.burn_addr.clone(),
+            );
+        }
+
+        // Make connections between block proofs, and check initial and final block
+        // values.
+        Self::connect_block_proof(&mut builder, has_parent_block, &parent_pv, &agg_pv);
+
+        let cyclic_vk = builder.add_verifier_data_public_inputs();
+        builder
+            .conditionally_verify_cyclic_proof_or_dummy::<C>(
+                has_parent_block,
+                &parent_block_proof,
+                &expected_common_data,
+            )
+            .expect("Failed to build cyclic recursion circuit");
+
+        let agg_verifier_data = builder.constant_verifier_data(&agg.circuit.verifier_only);
+        builder.verify_proof::<C>(&agg_root_proof, &agg_verifier_data, &agg.circuit.common);
+
+        let circuit = builder.build::<C>();
+        BlockCircuitData {
+            circuit,
+            has_parent_block,
+            parent_block_proof,
+            agg_root_proof,
             public_values,
             cyclic_vk,
         }
@@ -845,22 +1461,12 @@ where
         builder.connect(lhs.gas_used_after, rhs.gas_used_before);
     }
 
-    /// Extend a circuit to verify one of two proofs.
-    ///
-    /// # Arguments
-    ///
-    /// - `builder`: The circuit builder object.
-    /// - `base_circuit`: Circuit data describing the circuit of the base proof.
-    ///
-    /// # Outputs
-    ///
-    /// Returns a [`TwoToOneBlockChildTarget<D>`] object.
-    fn add_agg_child(
+    fn add_segment_agg_child(
         builder: &mut CircuitBuilder<F, D>,
-        base_circuit: &CircuitData<F, C, D>,
+        root: &RootCircuitData<F, C, D>,
     ) -> AggregationChildTarget<D> {
-        let common = &base_circuit.common;
-        let base_vk = builder.constant_verifier_data(&base_circuit.verifier_only);
+        let common = &root.circuit.common;
+        let root_vk = builder.constant_verifier_data(&root.circuit.verifier_only);
         let is_agg = builder.add_virtual_bool_target_safe();
         let agg_proof = builder.add_virtual_proof_with_pis(common);
         let base_proof = builder.add_virtual_proof_with_pis(common);
@@ -869,7 +1475,7 @@ where
                 is_agg,
                 &agg_proof,
                 &base_proof,
-                &base_vk,
+                &root_vk,
                 common,
             )
             .expect("Failed to build cyclic recursion circuit");
@@ -880,81 +1486,103 @@ where
         }
     }
 
-    fn create_block_circuit(agg: &AggregationCircuitData<F, C, D>) -> BlockCircuitData<F, C, D> {
-        // The block circuit is similar to the agg circuit; both verify two inner
-        // proofs. We need to adjust a few things, but it's easier than making a
-        // new CommonCircuitData.
-        let expected_common_data = CommonCircuitData {
-            fri_params: FriParams {
-                degree_bits: 14,
-                ..agg.circuit.common.fri_params.clone()
-            },
-            ..agg.circuit.common.clone()
-        };
+    fn add_segment_agg_child_with_dummy(
+        builder: &mut CircuitBuilder<F, D>,
+        root: &RootCircuitData<F, C, D>,
+        dummy_proof: ProofWithPublicInputsTarget<D>,
+    ) -> AggregationChildWithDummyTarget<D> {
+        let common = &root.circuit.common;
+        let root_vk = builder.constant_verifier_data(&root.circuit.verifier_only);
+        let is_agg = builder.add_virtual_bool_target_safe();
+        let agg_proof = builder.add_virtual_proof_with_pis(common);
+        let is_dummy = builder.add_virtual_bool_target_safe();
+        let real_proof = builder.add_virtual_proof_with_pis(common);
 
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let public_values = add_virtual_public_values(&mut builder);
-        let has_parent_block = builder.add_virtual_bool_target_safe();
-        let parent_block_proof = builder.add_virtual_proof_with_pis(&expected_common_data);
-        let agg_root_proof = builder.add_virtual_proof_with_pis(&agg.circuit.common);
-
-        // Connect block hashes
-        Self::connect_block_hashes(&mut builder, &parent_block_proof, &agg_root_proof);
-
-        let parent_pv = PublicValuesTarget::from_public_inputs(&parent_block_proof.public_inputs);
-        let agg_pv = PublicValuesTarget::from_public_inputs(&agg_root_proof.public_inputs);
-
-        // Connect block `trie_roots_before` with parent_pv `trie_roots_before`.
-        TrieRootsTarget::connect(
-            &mut builder,
-            public_values.trie_roots_before,
-            parent_pv.trie_roots_before,
-        );
-        // Connect the rest of block `public_values` with agg_pv.
-        TrieRootsTarget::connect(
-            &mut builder,
-            public_values.trie_roots_after,
-            agg_pv.trie_roots_after,
-        );
-        BlockMetadataTarget::connect(
-            &mut builder,
-            public_values.block_metadata,
-            agg_pv.block_metadata,
-        );
-        BlockHashesTarget::connect(
-            &mut builder,
-            public_values.block_hashes,
-            agg_pv.block_hashes,
-        );
-        ExtraBlockDataTarget::connect(
-            &mut builder,
-            public_values.extra_block_data,
-            agg_pv.extra_block_data,
-        );
-
-        // Make connections between block proofs, and check initial and final block
-        // values.
-        Self::connect_block_proof(&mut builder, has_parent_block, &parent_pv, &agg_pv);
-
-        let cyclic_vk = builder.add_verifier_data_public_inputs();
+        let segment_proof = builder.select_proof_with_pis(is_dummy, &dummy_proof, &real_proof);
         builder
-            .conditionally_verify_cyclic_proof_or_dummy::<C>(
-                has_parent_block,
-                &parent_block_proof,
-                &expected_common_data,
+            .conditionally_verify_cyclic_proof::<C>(
+                is_agg,
+                &agg_proof,
+                &segment_proof,
+                &root_vk,
+                common,
             )
             .expect("Failed to build cyclic recursion circuit");
+        AggregationChildWithDummyTarget {
+            is_agg,
+            is_dummy,
+            agg_proof,
+            real_proof,
+        }
+    }
 
-        let agg_verifier_data = builder.constant_verifier_data(&agg.circuit.verifier_only);
-        builder.verify_proof::<C>(&agg_root_proof, &agg_verifier_data, &agg.circuit.common);
+    fn add_txn_agg_child(
+        builder: &mut CircuitBuilder<F, D>,
+        segment_agg: &SegmentAggregationCircuitData<F, C, D>,
+    ) -> AggregationChildTarget<D> {
+        let common = &segment_agg.circuit.common;
+        let inner_segment_agg_vk =
+            builder.constant_verifier_data(&segment_agg.circuit.verifier_only);
+        let is_agg = builder.add_virtual_bool_target_safe();
+        let agg_proof = builder.add_virtual_proof_with_pis(common);
+        let base_proof = builder.add_virtual_proof_with_pis(common);
+        builder
+            .conditionally_verify_cyclic_proof::<C>(
+                is_agg,
+                &agg_proof,
+                &base_proof,
+                &inner_segment_agg_vk,
+                common,
+            )
+            .expect("Failed to build cyclic recursion circuit");
+        AggregationChildTarget {
+            is_agg,
+            agg_proof,
+            base_proof,
+        }
+    }
+
+    fn create_block_wrapper_circuit(
+        block: &BlockCircuitData<F, C, D>,
+    ) -> BlockWrapperCircuitData<F, C, D> {
+        let mut builder = CircuitBuilder::<F, D>::new(block.circuit.common.config.clone());
+
+        let parent_block_proof = builder.add_virtual_proof_with_pis(&block.circuit.common);
+        let parent_pv = PublicValuesTarget::from_public_inputs(&parent_block_proof.public_inputs);
+
+        let final_pv = add_virtual_final_public_values_public_input(&mut builder);
+
+        // This also enforces that the initial state trie root that will be stored in
+        // these `FinalPublicValues` actually matches the known checkpoint state trie
+        // root.
+        final_pv.connect_parent(&mut builder, &parent_pv);
+
+        let block_verifier_data = builder.constant_verifier_data(&block.circuit.verifier_only);
+
+        // We want these wrapped block proofs to have the exact same structure as 2-to-1
+        // aggregation proofs, so we add public inputs for cyclic verification,
+        // even though they'll be ignored.
+        let cyclic_vk = builder.add_verifier_data_public_inputs();
+
+        builder.verify_proof::<C>(
+            &parent_block_proof,
+            &block_verifier_data,
+            &block.circuit.common,
+        );
+
+        // Pad to match the (non-existing yet!) 2-to-1 circuit's degree.
+        // We use the block circuit's degree as target reference here, as they end up
+        // having same degree.
+        while log2_ceil(builder.num_gates()) < block.circuit.common.degree_bits() {
+            builder.add_gate(NoopGate, vec![]);
+        }
 
         let circuit = builder.build::<C>();
-        BlockCircuitData {
+
+        BlockWrapperCircuitData {
             circuit,
-            has_parent_block,
             parent_block_proof,
-            agg_root_proof,
-            public_values,
+            public_values: final_pv,
             cyclic_vk,
         }
     }
@@ -970,22 +1598,23 @@ where
     ///
     /// Returns a [`TwoToOneBlockCircuitData<F, C, D>`].
     fn create_two_to_one_block_circuit(
-        block_circuit: &BlockCircuitData<F, C, D>,
+        block_wrapper_circuit: &BlockWrapperCircuitData<F, C, D>,
     ) -> TwoToOneBlockCircuitData<F, C, D>
     where
         F: RichField + Extendable<D>,
         C: GenericConfig<D, F = F>,
         C::Hasher: AlgebraicHasher<F>,
     {
-        let mut builder = CircuitBuilder::<F, D>::new(block_circuit.circuit.common.config.clone());
+        let mut builder =
+            CircuitBuilder::<F, D>::new(block_wrapper_circuit.circuit.common.config.clone());
 
         let mix_hash = builder.add_virtual_hash_public_input();
 
         // We need to pad by PIS to match the count of PIS of the `base_proof`.
-        let mut padding = block_circuit.circuit.common.num_public_inputs;
+        let mut padding = block_wrapper_circuit.circuit.common.num_public_inputs;
         // The number of PIS that will be added *after* padding by
         // [`add_verifier_data_public_inputs()`].
-        padding -= verification_key_len(&block_circuit.circuit);
+        padding -= verification_key_len(&block_wrapper_circuit.circuit);
         // Account for `mix_pv_hash`.
         padding -= builder.num_public_inputs();
 
@@ -996,14 +1625,14 @@ where
 
         let cyclic_vk = builder.add_verifier_data_public_inputs();
 
-        let lhs = Self::add_agg_child(&mut builder, &block_circuit.circuit);
-        let rhs = Self::add_agg_child(&mut builder, &block_circuit.circuit);
+        let lhs = Self::add_agg_child(&mut builder, &block_wrapper_circuit.circuit);
+        let rhs = Self::add_agg_child(&mut builder, &block_wrapper_circuit.circuit);
 
         let lhs_public_inputs = lhs.public_inputs(&mut builder);
         let rhs_public_inputs = rhs.public_inputs(&mut builder);
 
-        let lhs_public_values = extract_block_public_values(&lhs_public_inputs);
-        let rhs_public_values = extract_block_public_values(&rhs_public_inputs);
+        let lhs_public_values = extract_block_final_public_values(&lhs_public_inputs);
+        let rhs_public_values = extract_block_final_public_values(&rhs_public_inputs);
 
         let lhs_agg_pv_hash = extract_two_to_one_block_hash(&lhs_public_inputs);
         let rhs_agg_pv_hash = extract_two_to_one_block_hash(&rhs_public_inputs);
@@ -1185,18 +1814,22 @@ where
     /// for a verifier to assert correctness of the computation,
     /// but the public values are output for the prover convenience, as these
     /// are necessary during proof aggregation.
-    pub fn prove_root(
+    pub fn prove_segment(
         &self,
         all_stark: &AllStark<F, D>,
         config: &StarkConfig,
-        generation_inputs: GenerationInputs,
+        generation_inputs: TrimmedGenerationInputs,
+        segment_data: &mut GenerationSegmentData,
         timing: &mut TimingTree,
         abort_signal: Option<Arc<AtomicBool>>,
-    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues)> {
+    ) -> anyhow::Result<ProverOutputData<F, C, D>> {
+        features_check(&generation_inputs);
+
         let all_proof = prove::<F, C, D>(
             all_stark,
             config,
             generation_inputs,
+            segment_data,
             timing,
             abort_signal.clone(),
         )?;
@@ -1233,7 +1866,7 @@ where
 
         root_inputs.set_verifier_data_target(
             &self.root.cyclic_vk,
-            &self.aggregation.circuit.verifier_only,
+            &self.segment_aggregation.circuit.verifier_only,
         );
 
         set_public_value_targets(
@@ -1247,7 +1880,54 @@ where
 
         let root_proof = self.root.circuit.prove(root_inputs)?;
 
-        Ok((root_proof, all_proof.public_values))
+        Ok(ProverOutputData {
+            is_dummy: false,
+            proof_with_pis: root_proof,
+            public_values: all_proof.public_values,
+        })
+    }
+
+    /// Returns a proof for each segment that is part of a full transaction
+    /// proof.
+    pub fn prove_all_segments(
+        &self,
+        all_stark: &AllStark<F, D>,
+        config: &StarkConfig,
+        generation_inputs: GenerationInputs,
+        max_cpu_len_log: usize,
+        timing: &mut TimingTree,
+        abort_signal: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<Vec<ProverOutputData<F, C, D>>> {
+        features_check(&generation_inputs.clone().trim());
+
+        let segment_iterator =
+            SegmentDataIterator::<F>::new(&generation_inputs, Some(max_cpu_len_log));
+
+        let mut proofs = vec![];
+
+        for segment_run in segment_iterator {
+            let (_, mut next_data) =
+                segment_run.map_err(|e: SegmentError| anyhow::format_err!(e))?;
+            let proof = self.prove_segment(
+                all_stark,
+                config,
+                generation_inputs.trim(),
+                &mut next_data,
+                timing,
+                abort_signal.clone(),
+            )?;
+            proofs.push(proof);
+        }
+
+        // Since aggregations require at least two segment proofs, add a dummy proof if
+        // there is only one proof.
+        if proofs.len() == 1 {
+            let mut first_proof = proofs[0].clone();
+            first_proof.is_dummy = true;
+            proofs.push(first_proof);
+        }
+
+        Ok(proofs)
     }
 
     /// From an initial set of STARK proofs passed with their associated
@@ -1291,7 +1971,7 @@ where
     /// let table_circuits = { ... };
     ///
     /// // Finally shrink the STARK proof.
-    /// let (proof, public_values) = prove_root_after_initial_stark(
+    /// let (proof, public_values) = prove_segment_after_initial_stark(
     ///     &all_stark,
     ///     &config,
     ///     &stark_proof,
@@ -1300,7 +1980,7 @@ where
     ///     abort_signal,
     /// ).unwrap();
     /// ```
-    pub fn prove_root_after_initial_stark(
+    pub fn prove_segment_after_initial_stark(
         &self,
         all_proof: AllProof<F, C, D>,
         table_circuits: &[(RecursiveCircuitsForTableSize<F, C, D>, u8); NUM_TABLES],
@@ -1326,7 +2006,7 @@ where
 
         root_inputs.set_verifier_data_target(
             &self.root.cyclic_vk,
-            &self.aggregation.circuit.verifier_only,
+            &self.segment_aggregation.circuit.verifier_only,
         );
 
         set_public_value_targets(
@@ -1348,36 +2028,150 @@ where
     }
 
     /// Create an aggregation proof, combining two contiguous proofs into a
-    /// single one. The combined proofs can either be transaction (aka root)
-    /// proofs, or other aggregation proofs, as long as their states are
-    /// contiguous, meaning that the final state of the left child proof is the
-    /// initial state of the right child proof.
+    /// single one. The combined proofs are segment proofs: they are proofs
+    /// of some parts of one execution.
     ///
-    /// While regular transaction proofs can only assert validity of a single
-    /// transaction, aggregation proofs can cover an arbitrary range, up to
-    /// an entire block with all its transactions.
+    /// While regular root proofs can only assert validity of a
+    /// single segment of a transaction, segment aggregation proofs
+    /// can cover an arbitrary range, up to an entire transaction.
     ///
     /// # Arguments
     ///
     /// - `lhs_is_agg`: a boolean indicating whether the left child proof is an
-    ///   aggregation proof or a regular transaction proof.
-    /// - `lhs_proof`: the left child proof.
-    /// - `lhs_public_values`: the public values associated to the right child
-    ///   proof.
+    ///   aggregation proof or a regular segment proof.
+    /// - `lhs_proof`: the left child prover output data.
     /// - `rhs_is_agg`: a boolean indicating whether the right child proof is an
     ///   aggregation proof or a regular transaction proof.
-    /// - `rhs_proof`: the right child proof.
-    /// - `rhs_public_values`: the public values associated to the right child
+    /// - `rhs_proof`: the right child prover output data.
+    ///
+    /// # Outputs
+    ///
+    /// This method outputs a [`ProverOutputData<F, C, D>`]. Only the proof with
+    /// public inputs is necessary for a verifier to assert correctness of
+    /// the computation, but the public values and `is_dummy` are output for the
+    /// prover convenience, as these are necessary during proof aggregation.
+    pub fn prove_segment_aggregation(
+        &self,
+        lhs_is_agg: bool,
+        lhs_prover_output: &ProverOutputData<F, C, D>,
+        rhs_is_agg: bool,
+        rhs_prover_output: &ProverOutputData<F, C, D>,
+    ) -> anyhow::Result<ProverOutputData<F, C, D>> {
+        let mut agg_inputs = PartialWitness::new();
+
+        let lhs_proof = &lhs_prover_output.proof_with_pis;
+        let rhs_proof = &rhs_prover_output.proof_with_pis;
+        let rhs_is_dummy = rhs_prover_output.is_dummy;
+        Self::set_dummy_if_necessary(
+            &self.segment_aggregation.lhs,
+            lhs_is_agg,
+            &self.segment_aggregation.circuit,
+            &mut agg_inputs,
+            lhs_proof,
+        );
+
+        // If rhs is dummy, the rhs proof is also set to be the lhs.
+        let real_rhs_proof = if rhs_is_dummy { lhs_proof } else { rhs_proof };
+
+        Self::set_dummy_if_necessary_with_dummy(
+            &self.segment_aggregation.rhs,
+            rhs_is_agg,
+            rhs_is_dummy,
+            &self.segment_aggregation.circuit,
+            &mut agg_inputs,
+            real_rhs_proof,
+        );
+
+        agg_inputs.set_verifier_data_target(
+            &self.segment_aggregation.cyclic_vk,
+            &self.segment_aggregation.circuit.verifier_only,
+        );
+
+        // Aggregates both `PublicValues` from the provided proofs into a single one.
+
+        let lhs_public_values = &lhs_prover_output.public_values;
+        let rhs_public_values = &rhs_prover_output.public_values;
+
+        let real_public_values = if rhs_is_dummy {
+            lhs_public_values.clone()
+        } else {
+            rhs_public_values.clone()
+        };
+
+        let agg_public_values = PublicValues {
+            trie_roots_before: lhs_public_values.trie_roots_before.clone(),
+            trie_roots_after: real_public_values.trie_roots_after,
+            burn_addr: lhs_public_values.burn_addr,
+            extra_block_data: ExtraBlockData {
+                checkpoint_state_trie_root: lhs_public_values
+                    .extra_block_data
+                    .checkpoint_state_trie_root,
+                txn_number_before: lhs_public_values.extra_block_data.txn_number_before,
+                txn_number_after: real_public_values.extra_block_data.txn_number_after,
+                gas_used_before: lhs_public_values.extra_block_data.gas_used_before,
+                gas_used_after: real_public_values.extra_block_data.gas_used_after,
+            },
+            block_metadata: real_public_values.block_metadata,
+            block_hashes: real_public_values.block_hashes,
+            registers_before: lhs_public_values.registers_before.clone(),
+            registers_after: real_public_values.registers_after,
+            mem_before: lhs_public_values.mem_before.clone(),
+            mem_after: real_public_values.mem_after,
+        };
+
+        set_public_value_targets(
+            &mut agg_inputs,
+            &self.segment_aggregation.public_values,
+            &agg_public_values,
+        )
+        .map_err(|_| {
+            anyhow::Error::msg("Invalid conversion when setting public values targets.")
+        })?;
+
+        let aggregation_proof = self.segment_aggregation.circuit.prove(agg_inputs)?;
+        let agg_output = ProverOutputData {
+            is_dummy: false,
+            proof_with_pis: aggregation_proof,
+            public_values: agg_public_values,
+        };
+        Ok(agg_output)
+    }
+
+    pub fn verify_segment_aggregation(
+        &self,
+        agg_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> anyhow::Result<()> {
+        self.segment_aggregation.circuit.verify(agg_proof.clone())?;
+        check_cyclic_proof_verifier_data(
+            agg_proof,
+            &self.segment_aggregation.circuit.verifier_only,
+            &self.segment_aggregation.circuit.common,
+        )
+    }
+
+    /// Creates a final transaction proof, once all segments of a given
+    /// transaction have been combined into a single aggregation proof.
+    ///
+    /// Transaction proofs can either be generated as a standalone, or combined
+    /// with a previous transaction proof to assert validity of a range of
+    /// transactions.
+    ///
+    /// # Arguments
+    ///
+    /// - `opt_parent_txn_proof`: an optional parent transaction proof. Passing
+    ///   one will generate a proof of validity for both the transaction range
+    ///   covered by the previous proof and the current transaction.
+    /// - `agg_proof`: the final aggregation proof containing all segments
+    ///   within the current transaction.
+    /// - `public_values`: the public values associated to the aggregation
     ///   proof.
     ///
     /// # Outputs
     ///
     /// This method outputs a tuple of [`ProofWithPublicInputs<F, C, D>`] and
     /// its [`PublicValues`]. Only the proof with public inputs is necessary
-    /// for a verifier to assert correctness of the computation,
-    /// but the public values are output for the prover convenience, as these
-    /// are necessary during proof aggregation.
-    pub fn prove_aggregation(
+    /// for a verifier to assert correctness of the computation.
+    pub fn prove_transaction_aggregation(
         &self,
         lhs_is_agg: bool,
         lhs_proof: &ProofWithPublicInputs<F, C, D>,
@@ -1386,61 +2180,89 @@ where
         rhs_proof: &ProofWithPublicInputs<F, C, D>,
         rhs_public_values: PublicValues,
     ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, PublicValues)> {
-        let mut agg_inputs = PartialWitness::new();
+        let mut txn_inputs = PartialWitness::new();
 
-        agg_inputs.set_bool_target(self.aggregation.lhs.is_agg, lhs_is_agg);
-        agg_inputs.set_proof_with_pis_target(&self.aggregation.lhs.agg_proof, lhs_proof);
-        agg_inputs.set_proof_with_pis_target(&self.aggregation.lhs.base_proof, lhs_proof);
-
-        agg_inputs.set_bool_target(self.aggregation.rhs.is_agg, rhs_is_agg);
-        agg_inputs.set_proof_with_pis_target(&self.aggregation.rhs.agg_proof, rhs_proof);
-        agg_inputs.set_proof_with_pis_target(&self.aggregation.rhs.base_proof, rhs_proof);
-
-        agg_inputs.set_verifier_data_target(
-            &self.aggregation.cyclic_vk,
-            &self.aggregation.circuit.verifier_only,
+        Self::set_dummy_if_necessary(
+            &self.txn_aggregation.lhs,
+            lhs_is_agg,
+            &self.txn_aggregation.circuit,
+            &mut txn_inputs,
+            lhs_proof,
         );
 
-        // Aggregates both `PublicValues` from the provided proofs into a single one.
-        let agg_public_values = PublicValues {
+        Self::set_dummy_if_necessary(
+            &self.txn_aggregation.rhs,
+            rhs_is_agg,
+            &self.txn_aggregation.circuit,
+            &mut txn_inputs,
+            rhs_proof,
+        );
+
+        txn_inputs.set_verifier_data_target(
+            &self.txn_aggregation.cyclic_vk,
+            &self.txn_aggregation.circuit.verifier_only,
+        );
+
+        let txn_public_values = PublicValues {
             trie_roots_before: lhs_public_values.trie_roots_before,
-            trie_roots_after: rhs_public_values.trie_roots_after,
             extra_block_data: ExtraBlockData {
-                checkpoint_state_trie_root: lhs_public_values
-                    .extra_block_data
-                    .checkpoint_state_trie_root,
                 txn_number_before: lhs_public_values.extra_block_data.txn_number_before,
-                txn_number_after: rhs_public_values.extra_block_data.txn_number_after,
                 gas_used_before: lhs_public_values.extra_block_data.gas_used_before,
-                gas_used_after: rhs_public_values.extra_block_data.gas_used_after,
+                ..rhs_public_values.extra_block_data
             },
-            block_metadata: rhs_public_values.block_metadata,
-            block_hashes: rhs_public_values.block_hashes,
+            ..rhs_public_values
         };
 
         set_public_value_targets(
-            &mut agg_inputs,
-            &self.aggregation.public_values,
-            &agg_public_values,
+            &mut txn_inputs,
+            &self.txn_aggregation.public_values,
+            &txn_public_values,
         )
         .map_err(|_| {
             anyhow::Error::msg("Invalid conversion when setting public values targets.")
         })?;
 
-        let aggregation_proof = self.aggregation.circuit.prove(agg_inputs)?;
-        Ok((aggregation_proof, agg_public_values))
+        let txn_proof = self.txn_aggregation.circuit.prove(txn_inputs)?;
+        Ok((txn_proof, txn_public_values))
     }
 
-    pub fn verify_aggregation(
+    pub fn verify_txn_aggregation(
         &self,
-        agg_proof: &ProofWithPublicInputs<F, C, D>,
+        txn_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> anyhow::Result<()> {
-        self.aggregation.circuit.verify(agg_proof.clone())?;
+        self.txn_aggregation.circuit.verify(txn_proof.clone())?;
         check_cyclic_proof_verifier_data(
-            agg_proof,
-            &self.aggregation.circuit.verifier_only,
-            &self.aggregation.circuit.common,
+            txn_proof,
+            &self.txn_aggregation.circuit.verifier_only,
+            &self.txn_aggregation.circuit.common,
         )
+    }
+
+    /// If the proof is not an aggregation, we set the cyclic vk to a dummy
+    /// value, so that it corresponds to the aggregation cyclic vk. If the proof
+    /// is dummy, we set `is_dummy` to `true`. Note that only the rhs can be
+    /// dummy.
+    fn set_dummy_if_necessary_with_dummy(
+        agg_child: &AggregationChildWithDummyTarget<D>,
+        is_agg: bool,
+        is_dummy: bool,
+        circuit: &CircuitData<F, C, D>,
+        agg_inputs: &mut PartialWitness<F>,
+        proof: &ProofWithPublicInputs<F, C, D>,
+    ) {
+        agg_inputs.set_bool_target(agg_child.is_agg, is_agg);
+        agg_inputs.set_bool_target(agg_child.is_dummy, is_dummy);
+        if is_agg {
+            agg_inputs.set_proof_with_pis_target(&agg_child.agg_proof, proof);
+        } else {
+            Self::set_dummy_proof_with_cyclic_vk_pis(
+                circuit,
+                agg_inputs,
+                &agg_child.agg_proof,
+                proof,
+            );
+        }
+        agg_inputs.set_proof_with_pis_target(&agg_child.real_proof, proof);
     }
 
     /// Create a final block proof, once all transactions of a given block have
@@ -1495,21 +2317,19 @@ where
             let mut nonzero_pis = HashMap::new();
 
             // Initialize the checkpoint block roots before, and state root after.
-            let state_trie_root_before_keys = 0..TrieRootsTarget::HASH_SIZE;
+            let state_trie_root_before_keys = 0..TARGET_HASH_SIZE;
             for (key, &value) in state_trie_root_before_keys
                 .zip_eq(&h256_limbs::<F>(public_values.trie_roots_before.state_root))
             {
                 nonzero_pis.insert(key, value);
             }
-            let txn_trie_root_before_keys =
-                TrieRootsTarget::HASH_SIZE..TrieRootsTarget::HASH_SIZE * 2;
+            let txn_trie_root_before_keys = TARGET_HASH_SIZE..TARGET_HASH_SIZE * 2;
             for (key, &value) in txn_trie_root_before_keys.clone().zip_eq(&h256_limbs::<F>(
                 public_values.trie_roots_before.transactions_root,
             )) {
                 nonzero_pis.insert(key, value);
             }
-            let receipts_trie_root_before_keys =
-                TrieRootsTarget::HASH_SIZE * 2..TrieRootsTarget::HASH_SIZE * 3;
+            let receipts_trie_root_before_keys = TARGET_HASH_SIZE * 2..TARGET_HASH_SIZE * 3;
             for (key, &value) in receipts_trie_root_before_keys
                 .clone()
                 .zip_eq(&h256_limbs::<F>(
@@ -1519,20 +2339,40 @@ where
                 nonzero_pis.insert(key, value);
             }
             let state_trie_root_after_keys =
-                TrieRootsTarget::SIZE..TrieRootsTarget::SIZE + TrieRootsTarget::HASH_SIZE;
+                TrieRootsTarget::SIZE..TrieRootsTarget::SIZE + TARGET_HASH_SIZE;
             for (key, &value) in state_trie_root_after_keys
                 .zip_eq(&h256_limbs::<F>(public_values.trie_roots_before.state_root))
             {
                 nonzero_pis.insert(key, value);
             }
 
+            let burn_addr_offset = match cfg!(feature = "cdk_erigon") {
+                true => BurnAddrTarget::get_size(),
+                false => 0,
+            };
+
+            #[cfg(feature = "cdk_erigon")]
+            {
+                let burn_addr_keys =
+                    TrieRootsTarget::SIZE * 2..TrieRootsTarget::SIZE * 2 + burn_addr_offset;
+                for (key, &value) in burn_addr_keys.zip_eq(&crate::util::u256_limbs(
+                    public_values
+                        .burn_addr
+                        .expect("We should have a burn addr when cdk_erigon is activated"),
+                )) {
+                    nonzero_pis.insert(key, value);
+                }
+            }
             // Initialize the checkpoint state root extra data.
-            let checkpoint_state_trie_keys =
-                TrieRootsTarget::SIZE * 2 + BlockMetadataTarget::SIZE + BlockHashesTarget::SIZE
-                    ..TrieRootsTarget::SIZE * 2
-                        + BlockMetadataTarget::SIZE
-                        + BlockHashesTarget::SIZE
-                        + 8;
+            let checkpoint_state_trie_keys = burn_addr_offset
+                + TrieRootsTarget::SIZE * 2
+                + BlockMetadataTarget::SIZE
+                + BlockHashesTarget::SIZE
+                ..burn_addr_offset
+                    + TrieRootsTarget::SIZE * 2
+                    + BlockMetadataTarget::SIZE
+                    + BlockHashesTarget::SIZE
+                    + 8;
             for (key, &value) in checkpoint_state_trie_keys.zip_eq(&h256_limbs::<F>(
                 public_values.extra_block_data.checkpoint_state_trie_root,
             )) {
@@ -1541,9 +2381,13 @@ where
 
             // Initialize checkpoint block hashes.
             // These will be all zeros the initial genesis checkpoint.
-            let block_hashes_keys = TrieRootsTarget::SIZE * 2 + BlockMetadataTarget::SIZE
-                ..TrieRootsTarget::SIZE * 2 + BlockMetadataTarget::SIZE + BlockHashesTarget::SIZE
-                    - 8;
+            let block_hashes_keys =
+                burn_addr_offset + TrieRootsTarget::SIZE * 2 + BlockMetadataTarget::SIZE
+                    ..burn_addr_offset
+                        + TrieRootsTarget::SIZE * 2
+                        + BlockMetadataTarget::SIZE
+                        + BlockHashesTarget::SIZE
+                        - 8;
 
             for i in 0..public_values.block_hashes.prev_hashes.len() - 1 {
                 let targets = h256_limbs::<F>(public_values.block_hashes.prev_hashes[i]);
@@ -1551,8 +2395,11 @@ where
                     nonzero_pis.insert(block_hashes_keys.start + 8 * (i + 1) + j, targets[j]);
                 }
             }
-            let block_hashes_current_start =
-                TrieRootsTarget::SIZE * 2 + BlockMetadataTarget::SIZE + BlockHashesTarget::SIZE - 8;
+            let block_hashes_current_start = burn_addr_offset
+                + TrieRootsTarget::SIZE * 2
+                + BlockMetadataTarget::SIZE
+                + BlockHashesTarget::SIZE
+                - 8;
             let cur_targets = h256_limbs::<F>(public_values.block_hashes.prev_hashes[255]);
             for i in 0..8 {
                 nonzero_pis.insert(block_hashes_current_start + i, cur_targets[i]);
@@ -1561,7 +2408,7 @@ where
             // Initialize the checkpoint block number.
             // Subtraction would result in an invalid proof for genesis, but we shouldn't
             // try proving this block anyway.
-            let block_number_key = TrieRootsTarget::SIZE * 2 + 6;
+            let block_number_key = burn_addr_offset + TrieRootsTarget::SIZE * 2 + 6;
             nonzero_pis.insert(
                 block_number_key,
                 F::from_canonical_u64(public_values.block_metadata.block_number.low_u64() - 1),
@@ -1611,6 +2458,59 @@ where
             &self.block.circuit.verifier_only,
             &self.block.circuit.common,
         )
+    }
+
+    /// Wrap a block proof, representing one or an aggregation of contiguous
+    /// blocks, for easier aggregation with other chains' proofs.
+    ///
+    /// # Arguments
+    ///
+    /// - `block_proof`: the final block proof of a chain to be wrapped.
+    /// - `public_values`: the public values associated to the aggregation
+    ///   proof.
+    ///
+    /// # Outputs
+    ///
+    /// This method outputs a tuple of [`ProofWithPublicInputs<F, C, D>`] and
+    /// associated [`FinalPublicValues`]. Only the proof with public inputs is
+    /// necessary for a verifier to assert correctness of the computation.
+    pub fn prove_block_wrapper(
+        &self,
+        block_proof: &ProofWithPublicInputs<F, C, D>,
+        public_values: PublicValues,
+    ) -> anyhow::Result<(ProofWithPublicInputs<F, C, D>, FinalPublicValues)> {
+        let mut block_wrapper_inputs = PartialWitness::new();
+
+        block_wrapper_inputs
+            .set_proof_with_pis_target(&self.block_wrapper.parent_block_proof, block_proof);
+
+        block_wrapper_inputs.set_verifier_data_target(
+            &self.block_wrapper.cyclic_vk, // dummy
+            &self.block_wrapper.circuit.verifier_only,
+        );
+
+        let final_pvs = public_values.into();
+        set_final_public_value_targets(
+            &mut block_wrapper_inputs,
+            &self.block_wrapper.public_values,
+            &final_pvs,
+        )
+        .map_err(|_| {
+            anyhow::Error::msg("Invalid conversion when setting public values targets.")
+        })?;
+
+        let block_proof = self.block_wrapper.circuit.prove(block_wrapper_inputs)?;
+
+        Ok((block_proof, final_pvs))
+    }
+
+    pub fn verify_block_wrapper(
+        &self,
+        wrapped_block_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> anyhow::Result<()> {
+        self.block_wrapper
+            .circuit
+            .verify(wrapped_block_proof.clone())
     }
 
     /// Aggregates two proofs in manner similar to [`prove_aggregation`].
@@ -2032,10 +2932,12 @@ pub fn extract_two_to_one_block_hash<T>(public_inputs: &[T]) -> &[T; NUM_HASH_OU
 ///
 /// # Outputs
 ///
-/// - A slice containing exactly the public values.
-pub fn extract_block_public_values<T>(public_inputs: &[T]) -> &[T; PublicValuesTarget::SIZE] {
+/// - A slice containing exactly the final public values.
+pub fn extract_block_final_public_values<T>(
+    public_inputs: &[T],
+) -> &[T; FinalPublicValuesTarget::SIZE] {
     const PV_INDEX_START: usize = 0;
-    const PV_INDEX_END: usize = PV_INDEX_START + PublicValuesTarget::SIZE;
+    const PV_INDEX_END: usize = PV_INDEX_START + FinalPublicValuesTarget::SIZE;
     public_inputs[PV_INDEX_START..PV_INDEX_END]
         .try_into()
         .expect("Public inputs vector was malformed.")

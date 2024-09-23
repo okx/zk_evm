@@ -1,6 +1,7 @@
-use std::{collections::HashMap, fmt};
+use std::{cmp::min, collections::HashMap, ops::Range};
 
 use anyhow::{anyhow, Context as _};
+use ethereum_types::H160;
 use ethereum_types::{Address, BigEndianHash, H256, U256, U512};
 use evm_arithmetization::{
     generation::{
@@ -8,31 +9,36 @@ use evm_arithmetization::{
         GenerationInputs, TrieInputs,
     },
     proof::{BlockMetadata, ExtraBlockData, TrieRoots},
-    testing_utils::{BEACON_ROOTS_CONTRACT_ADDRESS_HASHED, HISTORY_BUFFER_LENGTH},
+    testing_utils::{
+        BEACON_ROOTS_CONTRACT_ADDRESS, BEACON_ROOTS_CONTRACT_ADDRESS_HASHED, HISTORY_BUFFER_LENGTH,
+    },
 };
 use mpt_trie::{
     nibbles::Nibbles,
-    partial_trie::{HashedPartialTrie, Node, PartialTrie},
+    partial_trie::{HashedPartialTrie, PartialTrie as _},
     special_query::path_for_query,
+    trie_ops::TrieOpError,
     utils::{IntoTrieKey as _, TriePath},
 };
+use zk_evm_common::gwei_to_wei;
 
 use crate::{
     hash,
     processed_block_trace::{
-        NodesUsedByTxn, ProcessedBlockTrace, ProcessedTxnInfo, StateTrieWrites, TxnMetaState,
+        NodesUsedByTxnBatch, ProcessedBlockTrace, ProcessedTxnBatchInfo, StateWrite, TxnMetaState,
     },
-    OtherBlockData, PartialTriePreImages,
+    typed_mpt::{ReceiptTrie, StateTrie, StorageTrie, TransactionTrie, TrieKey},
+    OtherBlockData, PartialTriePreImages, TryIntoExt as TryIntoBounds,
 };
 
 /// The current state of all tries as we process txn deltas. These are mutated
 /// after every txn we process in the trace.
 #[derive(Clone, Debug, Default)]
-struct PartialTrieState {
-    state: HashedPartialTrie,
-    storage: HashMap<H256, HashedPartialTrie>,
-    txn: HashedPartialTrie,
-    receipt: HashedPartialTrie,
+struct PartialTrieState<StateTrieT> {
+    state: StateTrieT,
+    storage: HashMap<H256, StorageTrie>,
+    txn: TransactionTrie,
+    receipt: ReceiptTrie,
 }
 
 /// Additional information discovered during delta application.
@@ -40,8 +46,8 @@ struct PartialTrieState {
 struct TrieDeltaApplicationOutput {
     // During delta application, if a delete occurs, we may have to make sure additional nodes
     // that are not accessed by the txn remain unhashed.
-    additional_state_trie_paths_to_not_hash: Vec<Nibbles>,
-    additional_storage_trie_paths_to_not_hash: HashMap<H256, Vec<Nibbles>>,
+    additional_state_trie_paths_to_not_hash: Vec<TrieKey>,
+    additional_storage_trie_paths_to_not_hash: HashMap<H256, Vec<TrieKey>>,
 }
 
 pub fn into_txn_proof_gen_ir(
@@ -51,13 +57,12 @@ pub fn into_txn_proof_gen_ir(
         withdrawals,
     }: ProcessedBlockTrace,
     other_data: OtherBlockData,
+    use_burn_addr: bool,
+    batch_size: usize,
 ) -> anyhow::Result<Vec<GenerationInputs>> {
     let mut curr_block_tries = PartialTrieState {
-        state: state.as_hashed_partial_trie().clone(),
-        storage: storage
-            .iter()
-            .map(|(k, v)| (*k, v.as_hashed_partial_trie().clone()))
-            .collect(),
+        state: state.clone(),
+        storage: storage.iter().map(|(k, v)| (*k, v.clone())).collect(),
         ..Default::default()
     };
 
@@ -69,29 +74,32 @@ pub fn into_txn_proof_gen_ir(
         gas_used_after: U256::zero(),
     };
 
-    // Dummy payloads do not increment this accumulator.
-    // For actual transactions, it will match their position in the block.
-    let mut txn_idx = 0;
+    let num_txs = txn_info
+        .iter()
+        .map(|tx_info| tx_info.meta.len())
+        .sum::<usize>();
 
     let mut txn_gen_inputs = txn_info
         .into_iter()
-        .map(|txn_info| {
-            let is_initial_payload = txn_idx == 0;
-
-            let current_idx = txn_idx;
-            if !txn_info.meta.is_dummy() {
-                txn_idx += 1;
-            }
+        .enumerate()
+        .map(|(txn_idx, txn_info)| {
+            let txn_range =
+                min(txn_idx * batch_size, num_txs)..min(txn_idx * batch_size + batch_size, num_txs);
+            let is_initial_payload = txn_range.start == 0;
 
             process_txn_info(
-                current_idx,
+                txn_range.clone(),
                 is_initial_payload,
                 txn_info,
                 &mut curr_block_tries,
                 &mut extra_data,
                 &other_data,
+                use_burn_addr,
             )
-            .context(format!("at transaction index {}", current_idx))
+            .context(format!(
+                "at transaction range {}..{}",
+                txn_range.start, txn_range.end
+            ))
         })
         .collect::<anyhow::Result<Vec<_>>>()
         .context(format!(
@@ -110,13 +118,12 @@ pub fn into_txn_proof_gen_ir(
 /// need to update the storage of the beacon block root contract.
 // See <https://eips.ethereum.org/EIPS/eip-4788>.
 fn update_beacon_block_root_contract_storage(
-    trie_state: &mut PartialTrieState,
+    trie_state: &mut PartialTrieState<impl StateTrie>,
     delta_out: &mut TrieDeltaApplicationOutput,
-    nodes_used: &mut NodesUsedByTxn,
+    nodes_used: &mut NodesUsedByTxnBatch,
     block_data: &BlockMetadata,
 ) -> anyhow::Result<()> {
     const HISTORY_BUFFER_LENGTH_MOD: U256 = U256([HISTORY_BUFFER_LENGTH.1, 0, 0, 0]);
-    const ADDRESS: H256 = H256(BEACON_ROOTS_CONTRACT_ADDRESS_HASHED);
 
     let timestamp_idx = block_data.block_timestamp % HISTORY_BUFFER_LENGTH_MOD;
     let timestamp = rlp::encode(&block_data.block_timestamp).to_vec();
@@ -129,44 +136,51 @@ fn update_beacon_block_root_contract_storage(
 
     let storage_trie = trie_state
         .storage
-        .get_mut(&ADDRESS)
-        .context(format!("missing account storage trie {:x}", ADDRESS))?;
+        .get_mut(&BEACON_ROOTS_CONTRACT_ADDRESS_HASHED)
+        .context(format!(
+            "missing account storage trie for address {:x}",
+            BEACON_ROOTS_CONTRACT_ADDRESS
+        ))?;
 
-    let mut slots_nibbles = vec![];
+    let slots_nibbles = nodes_used
+        .storage_accesses
+        .entry(BEACON_ROOTS_CONTRACT_ADDRESS_HASHED)
+        .or_default();
 
-    for (slot, val) in [(timestamp_idx, timestamp), (root_idx, calldata)]
-        .iter()
-        .map(|(k, v)| {
-            (
-                Nibbles::from_h256_be(hash(Nibbles::from_h256_be(H256::from_uint(k)).bytes_be())),
-                v,
-            )
-        })
-    {
+    for (ix, val) in [(timestamp_idx, timestamp), (root_idx, calldata)] {
+        // TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+        //                document this
+        let slot = TrieKey::from_nibbles(Nibbles::from_h256_be(hash(
+            Nibbles::from_h256_be(H256::from_uint(&ix)).bytes_be(),
+        )));
+
         slots_nibbles.push(slot);
 
         // If we are writing a zero, then we actually need to perform a delete.
-        match val == &ZERO_STORAGE_SLOT_VAL_RLPED {
+        match val == ZERO_STORAGE_SLOT_VAL_RLPED {
             false => {
                 storage_trie.insert(slot, val.clone()).context(format!(
-                    "at slot {} with value {}",
-                    CustomFmt(U512::from_big_endian(slot.bytes_be().as_slice())),
+                    "at slot {:?} with value {}",
+                    slot,
                     U512::from_big_endian(val.as_slice())
                 ))?;
 
                 delta_out
                     .additional_storage_trie_paths_to_not_hash
-                    .entry(ADDRESS)
+                    .entry(BEACON_ROOTS_CONTRACT_ADDRESS_HASHED)
                     .or_default()
                     .push(slot);
             }
             true => {
                 if let Ok(Some(remaining_slot_key)) =
-                    delete_node_and_report_remaining_key_if_branch_collapsed(storage_trie, &slot)
+                    delete_node_and_report_remaining_key_if_branch_collapsed(
+                        storage_trie.as_mut_hashed_partial_trie_unchecked(),
+                        &slot,
+                    )
                 {
                     delta_out
                         .additional_storage_trie_paths_to_not_hash
-                        .entry(ADDRESS)
+                        .entry(BEACON_ROOTS_CONTRACT_ADDRESS_HASHED)
                         .or_default()
                         .push(remaining_slot_key);
                 }
@@ -174,63 +188,61 @@ fn update_beacon_block_root_contract_storage(
         }
     }
 
-    nodes_used.storage_accesses.push((ADDRESS, slots_nibbles));
-
-    let addr_nibbles = Nibbles::from_h256_be(ADDRESS);
     delta_out
         .additional_state_trie_paths_to_not_hash
-        .push(addr_nibbles);
-    let addr_bytes = trie_state
+        .push(TrieKey::from_hash(BEACON_ROOTS_CONTRACT_ADDRESS_HASHED));
+    let mut account = trie_state
         .state
-        .get(addr_nibbles)
-        .context(format!("missing account storage trie {:x}", ADDRESS))?;
-    let mut account = account_from_rlped_bytes(addr_bytes)?;
+        .get_by_address(BEACON_ROOTS_CONTRACT_ADDRESS)
+        .context(format!(
+            "missing account storage trie for address {:x}",
+            BEACON_ROOTS_CONTRACT_ADDRESS
+        ))?;
 
-    account.storage_root = storage_trie.hash();
+    account.storage_root = storage_trie.root();
 
-    let updated_account_bytes = rlp::encode(&account);
     trie_state
         .state
-        .insert(addr_nibbles, updated_account_bytes.to_vec())
-        .context(format!(
-            "at slot {}",
-            CustomFmt(U512::from_big_endian(addr_nibbles.bytes_be().as_slice()))
-        ))?;
+        .insert_by_address(BEACON_ROOTS_CONTRACT_ADDRESS, account)
+        // TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+        //                Add an entry API
+        .expect("insert must succeed with the same key as a successful `get`");
 
     Ok(())
 }
 
 fn update_txn_and_receipt_tries(
-    trie_state: &mut PartialTrieState,
+    trie_state: &mut PartialTrieState<impl StateTrie>,
     meta: &TxnMetaState,
     txn_idx: usize,
 ) -> anyhow::Result<()> {
-    if meta.is_dummy() {
-        // This is a dummy payload, that does not mutate these tries.
-        return Ok(());
-    }
-
-    let txn_k = Nibbles::from_bytes_be(&rlp::encode(&txn_idx)).unwrap();
-    trie_state.txn.insert(txn_k, meta.txn_bytes())?;
-
-    Ok(trie_state
-        .receipt
-        .insert(txn_k, meta.receipt_node_bytes.as_ref())?)
+    if let Some(bytes) = &meta.txn_bytes {
+        trie_state.txn.insert(txn_idx, bytes.clone())?;
+        trie_state
+            .receipt
+            .insert(txn_idx, meta.receipt_node_bytes.clone())?;
+    } // else it's just a dummy
+    Ok(())
 }
 
 /// If the account does not have a storage trie or does but is not
 /// accessed by any txns, then we still need to manually create an entry for
 /// them.
 fn init_any_needed_empty_storage_tries<'a>(
-    storage_tries: &mut HashMap<H256, HashedPartialTrie>,
+    storage_tries: &mut HashMap<H256, StorageTrie>,
     accounts_with_storage: impl Iterator<Item = &'a H256>,
-    state_accounts_with_no_accesses_but_storage_tries: &'a HashMap<H256, H256>,
+    accts_with_unaccessed_storage: &HashMap<H256, H256>,
 ) {
     for h_addr in accounts_with_storage {
         if !storage_tries.contains_key(h_addr) {
-            let trie = state_accounts_with_no_accesses_but_storage_tries
+            let trie = accts_with_unaccessed_storage
                 .get(h_addr)
-                .map(|s_root| HashedPartialTrie::new(Node::Hash(*s_root)))
+                .map(|s_root| {
+                    let mut it = StorageTrie::default();
+                    it.insert_hash(TrieKey::default(), *s_root)
+                        .expect("empty trie insert cannot fail");
+                    it
+                })
                 .unwrap_or_default();
 
             storage_tries.insert(*h_addr, trie);
@@ -239,35 +251,42 @@ fn init_any_needed_empty_storage_tries<'a>(
 }
 
 fn create_minimal_partial_tries_needed_by_txn(
-    curr_block_tries: &PartialTrieState,
-    nodes_used_by_txn: &NodesUsedByTxn,
-    txn_idx: usize,
+    curr_block_tries: &PartialTrieState<impl StateTrie + Clone + TryIntoBounds<HashedPartialTrie>>,
+    nodes_used_by_txn: &NodesUsedByTxnBatch,
+    txn_range: Range<usize>,
     delta_application_out: TrieDeltaApplicationOutput,
 ) -> anyhow::Result<TrieInputs> {
-    let state_trie = create_minimal_state_partial_trie(
-        &curr_block_tries.state,
-        nodes_used_by_txn.state_accesses.iter().cloned(),
-        delta_application_out
-            .additional_state_trie_paths_to_not_hash
-            .into_iter(),
+    let mut state_trie = curr_block_tries.state.clone();
+    state_trie.trim_to(
+        nodes_used_by_txn
+            .state_accesses
+            .iter()
+            .map(|it| TrieKey::from_address(*it))
+            .chain(delta_application_out.additional_state_trie_paths_to_not_hash),
     )?;
 
-    let txn_k = Nibbles::from_bytes_be(&rlp::encode(&txn_idx)).unwrap();
+    let txn_keys = txn_range.map(TrieKey::from_txn_ix);
 
-    let transactions_trie =
-        create_trie_subset_wrapped(&curr_block_tries.txn, [txn_k], TrieType::Txn)?;
+    let transactions_trie = create_trie_subset_wrapped(
+        curr_block_tries.txn.as_hashed_partial_trie(),
+        txn_keys.clone(),
+        TrieType::Txn,
+    )?;
 
-    let receipts_trie =
-        create_trie_subset_wrapped(&curr_block_tries.receipt, [txn_k], TrieType::Receipt)?;
+    let receipts_trie = create_trie_subset_wrapped(
+        curr_block_tries.receipt.as_hashed_partial_trie(),
+        txn_keys,
+        TrieType::Receipt,
+    )?;
 
     let storage_tries = create_minimal_storage_partial_tries(
         &curr_block_tries.storage,
-        nodes_used_by_txn.storage_accesses.iter(),
+        &nodes_used_by_txn.storage_accesses,
         &delta_application_out.additional_storage_trie_paths_to_not_hash,
     )?;
 
     Ok(TrieInputs {
-        state_trie,
+        state_trie: state_trie.try_into()?,
         transactions_trie,
         receipts_trie,
         storage_tries,
@@ -275,9 +294,9 @@ fn create_minimal_partial_tries_needed_by_txn(
 }
 
 fn apply_deltas_to_trie_state(
-    trie_state: &mut PartialTrieState,
-    deltas: &NodesUsedByTxn,
-    meta: &TxnMetaState,
+    trie_state: &mut PartialTrieState<impl StateTrie>,
+    deltas: &NodesUsedByTxnBatch,
+    meta: &[TxnMetaState],
 ) -> anyhow::Result<TrieDeltaApplicationOutput> {
     let mut out = TrieDeltaApplicationOutput::default();
 
@@ -290,21 +309,21 @@ fn apply_deltas_to_trie_state(
                 hashed_acc_addr
             ))?;
 
-        for (slot, val) in storage_writes
-            .iter()
-            .map(|(k, v)| (Nibbles::from_h256_be(hash(k.bytes_be())), v))
-        {
+        for (key, val) in storage_writes {
+            let slot = TrieKey::from_hash(hash(key.into_nibbles().bytes_be()));
             // If we are writing a zero, then we actually need to perform a delete.
             match val == &ZERO_STORAGE_SLOT_VAL_RLPED {
-                false => storage_trie.insert(slot, val.clone()).context(format!(
-                    "at slot {} with value {}",
-                    CustomFmt(U512::from_big_endian(slot.bytes_be().as_slice())),
-                    U512::from_big_endian(val.as_slice())
-                ))?,
+                false => {
+                    storage_trie.insert(slot, val.clone()).context(format!(
+                        "at slot {:?} with value {}",
+                        slot,
+                        U512::from_big_endian(val.as_slice())
+                    ))?;
+                }
                 true => {
                     if let Some(remaining_slot_key) =
                         delete_node_and_report_remaining_key_if_branch_collapsed(
-                            storage_trie,
+                            storage_trie.as_mut_hashed_partial_trie_unchecked(),
                             &slot,
                         )?
                     {
@@ -318,43 +337,51 @@ fn apply_deltas_to_trie_state(
         }
     }
 
-    for (hashed_acc_addr, s_trie_writes) in deltas.state_writes.iter() {
-        let val_k = Nibbles::from_h256_be(*hashed_acc_addr);
-
+    for (addr, state_write) in &deltas.state_writes {
         // If the account was created, then it will not exist in the trie yet.
-        let is_created = !trie_state.state.contains(val_k);
-        let mut account = trie_state
-            .state
-            .get(val_k)
-            .map(account_from_rlped_bytes)
-            .transpose()?
-            .unwrap_or_default();
+        let is_created = !trie_state.state.contains_address(*addr);
+        let mut account = trie_state.state.get_by_address(*addr).unwrap_or_default();
 
-        s_trie_writes.apply_writes_to_state_node(
-            &mut account,
-            hashed_acc_addr,
-            &trie_state.storage,
-        )?;
+        state_write.apply_writes_to_state_node(&mut account, &hash(addr), &trie_state.storage)?;
 
-        let updated_account_bytes = rlp::encode(&account);
+        trie_state.state.insert_by_address(*addr, account)?;
+
         if is_created {
             // If the account did not exist prior this transaction, we
             // need to make sure the transaction didn't revert.
 
-            // Check status in the receipt.
-            let (_, _, receipt) = decode_receipt(&meta.receipt_node_bytes)
+            // We will check the status of the last receipt that attempted to create the
+            // account in this batch.
+            let last_creation_receipt = &meta
+                .iter()
+                .rev()
+                .find(|tx| tx.created_accounts.contains(addr))
+                .expect("We should have found a matching transaction")
+                .receipt_node_bytes;
+
+            let (_, _, receipt) = decode_receipt(last_creation_receipt)
                 .map_err(|_| anyhow!("couldn't RLP-decode receipt node bytes"))?;
 
             if !receipt.status {
                 // The transaction failed, hence any created account should be removed.
-                trie_state.state.delete(val_k)?;
-                trie_state.storage.remove(hashed_acc_addr);
-                continue;
+                if let Some(remaining_account_key) = trie_state.state.reporting_remove(*addr)? {
+                    out.additional_state_trie_paths_to_not_hash
+                        .push(remaining_account_key);
+                    trie_state.storage.remove(&hash(addr));
+                    continue;
+                }
             }
         }
-        trie_state
-            .state
-            .insert(val_k, updated_account_bytes.to_vec())?;
+    }
+
+    // Remove any accounts that self-destructed.
+    for addr in deltas.self_destructed_accounts.iter() {
+        trie_state.storage.remove(&hash(addr));
+
+        if let Some(remaining_account_key) = trie_state.state.reporting_remove(*addr)? {
+            out.additional_state_trie_paths_to_not_hash
+                .push(remaining_account_key);
+        }
     }
 
     Ok(out)
@@ -367,17 +394,18 @@ fn get_trie_trace(trie: &HashedPartialTrie, k: &Nibbles) -> TriePath {
 /// If a branch collapse occurred after a delete, then we must ensure that
 /// the other single child that remains also is not hashed when passed into
 /// plonky2. Returns the key to the remaining child if a collapse occurred.
-fn delete_node_and_report_remaining_key_if_branch_collapsed(
+pub fn delete_node_and_report_remaining_key_if_branch_collapsed(
     trie: &mut HashedPartialTrie,
-    delete_k: &Nibbles,
-) -> anyhow::Result<Option<Nibbles>> {
-    let old_trace = get_trie_trace(trie, delete_k);
-    trie.delete(*delete_k)?;
-    let new_trace = get_trie_trace(trie, delete_k);
-
-    Ok(node_deletion_resulted_in_a_branch_collapse(
-        &old_trace, &new_trace,
-    ))
+    key: &TrieKey,
+) -> Result<Option<TrieKey>, TrieOpError> {
+    let key = key.into_nibbles();
+    let old_trace = get_trie_trace(trie, &key);
+    trie.delete(key)?;
+    let new_trace = get_trie_trace(trie, &key);
+    Ok(
+        node_deletion_resulted_in_a_branch_collapse(&old_trace, &new_trace)
+            .map(TrieKey::from_nibbles),
+    )
 }
 
 /// Comparing the path of the deleted key before and after the deletion,
@@ -408,12 +436,14 @@ fn node_deletion_resulted_in_a_branch_collapse(
 /// The withdrawals are always in the final ir payload.
 fn add_withdrawals_to_txns(
     txn_ir: &mut [GenerationInputs],
-    final_trie_state: &mut PartialTrieState,
+    final_trie_state: &mut PartialTrieState<
+        impl StateTrie + Clone + TryIntoBounds<HashedPartialTrie>,
+    >,
     mut withdrawals: Vec<(Address, U256)>,
 ) -> anyhow::Result<()> {
     // Scale withdrawals amounts.
     for (_addr, amt) in withdrawals.iter_mut() {
-        *amt = eth_to_gwei(*amt)
+        *amt = gwei_to_wei(*amt)
     }
 
     let withdrawals_with_hashed_addrs_iter = || {
@@ -426,26 +456,23 @@ fn add_withdrawals_to_txns(
         .last_mut()
         .expect("We cannot have an empty list of payloads.");
 
-    if last_inputs.signed_txn.is_none() {
-        // This is a dummy payload, hence it does not contain yet
-        // state accesses to the withdrawal addresses.
-        let withdrawal_addrs = withdrawals_with_hashed_addrs_iter().map(|(_, h_addr, _)| h_addr);
-
-        let additional_paths = if last_inputs.txn_number_before == 0.into() {
-            // We need to include the beacon roots contract as this payload is at the
-            // start of the block execution.
-            vec![Nibbles::from_h256_be(H256(
-                BEACON_ROOTS_CONTRACT_ADDRESS_HASHED,
-            ))]
-        } else {
-            vec![]
-        };
-
-        last_inputs.tries.state_trie = create_minimal_state_partial_trie(
-            &final_trie_state.state,
-            withdrawal_addrs,
-            additional_paths.into_iter(),
+    if last_inputs.signed_txns.is_empty() {
+        let mut state_trie = final_trie_state.state.clone();
+        state_trie.trim_to(
+            // This is a dummy payload, hence it does not contain yet
+            // state accesses to the withdrawal addresses.
+            withdrawals
+                .iter()
+                .map(|(addr, _)| *addr)
+                .chain(match last_inputs.txn_number_before == 0.into() {
+                    // We need to include the beacon roots contract as this payload is at the
+                    // start of the block execution.
+                    true => Some(BEACON_ROOTS_CONTRACT_ADDRESS),
+                    false => None,
+                })
+                .map(TrieKey::from_address),
         )?;
+        last_inputs.tries.state_trie = state_trie.try_into()?;
     }
 
     update_trie_state_from_withdrawals(
@@ -454,7 +481,7 @@ fn add_withdrawals_to_txns(
     )?;
 
     last_inputs.withdrawals = withdrawals;
-    last_inputs.trie_roots_after.state_root = final_trie_state.state.hash();
+    last_inputs.trie_roots_after.state_root = final_trie_state.state.clone().try_into()?.hash();
 
     Ok(())
 }
@@ -463,19 +490,20 @@ fn add_withdrawals_to_txns(
 /// our local trie state.
 fn update_trie_state_from_withdrawals<'a>(
     withdrawals: impl IntoIterator<Item = (Address, H256, U256)> + 'a,
-    state: &mut HashedPartialTrie,
+    state: &mut impl StateTrie,
 ) -> anyhow::Result<()> {
     for (addr, h_addr, amt) in withdrawals {
-        let h_addr_nibs = Nibbles::from_h256_be(h_addr);
-
-        let acc_bytes = state.get(h_addr_nibs).context(format!(
+        let mut acc_data = state.get_by_address(addr).context(format!(
             "No account present at {addr:x} (hashed: {h_addr:x}) to withdraw {amt} Gwei from!"
         ))?;
-        let mut acc_data = account_from_rlped_bytes(acc_bytes)?;
 
         acc_data.balance += amt;
 
-        state.insert(h_addr_nibs, rlp::encode(&acc_data).to_vec())?;
+        state
+            .insert_by_address(addr, acc_data)
+            // TODO(0xaatif): https://github.com/0xPolygonZero/zk_evm/issues/275
+            //                Add an entry API
+            .expect("insert must succeed with the same key as a successful `get`");
     }
 
     Ok(())
@@ -483,37 +511,45 @@ fn update_trie_state_from_withdrawals<'a>(
 
 /// Processes a single transaction in the trace.
 fn process_txn_info(
-    txn_idx: usize,
+    txn_range: Range<usize>,
     is_initial_payload: bool,
-    txn_info: ProcessedTxnInfo,
-    curr_block_tries: &mut PartialTrieState,
+    txn_info: ProcessedTxnBatchInfo,
+    curr_block_tries: &mut PartialTrieState<
+        impl StateTrie + Clone + TryIntoBounds<HashedPartialTrie>,
+    >,
     extra_data: &mut ExtraBlockData,
     other_data: &OtherBlockData,
+    use_burn_target: bool,
 ) -> anyhow::Result<GenerationInputs> {
-    log::trace!("Generating proof IR for txn {}...", txn_idx);
+    log::trace!(
+        "Generating proof IR for txn {} through {}...",
+        txn_range.start,
+        txn_range.end - 1
+    );
 
     init_any_needed_empty_storage_tries(
         &mut curr_block_tries.storage,
-        txn_info
-            .nodes_used_by_txn
-            .storage_accesses
-            .iter()
-            .map(|(k, _)| k),
-        &txn_info
-            .nodes_used_by_txn
-            .state_accounts_with_no_accesses_but_storage_tries,
+        txn_info.nodes_used_by_txn.storage_accesses.keys(),
+        &txn_info.nodes_used_by_txn.accts_with_unaccessed_storage,
     );
-    // For each non-dummy txn, we increment `txn_number_after` by 1, and
+
+    // For each non-dummy txn, we increment `txn_number_after` and
     // update `gas_used_after` accordingly.
-    extra_data.txn_number_after += U256::from(!txn_info.meta.is_dummy() as u8);
-    extra_data.gas_used_after += txn_info.meta.gas_used.into();
+    extra_data.txn_number_after += txn_info.meta.len().into();
+    extra_data.gas_used_after += txn_info.meta.iter().map(|i| i.gas_used).sum::<u64>().into();
 
     // Because we need to run delta application before creating the minimal
     // sub-tries (we need to detect if deletes collapsed any branches), we need to
     // do this clone every iteration.
     let tries_at_start_of_txn = curr_block_tries.clone();
 
-    update_txn_and_receipt_tries(curr_block_tries, &txn_info.meta, txn_idx)?;
+    for (i, meta) in txn_info.meta.iter().enumerate() {
+        update_txn_and_receipt_tries(
+            curr_block_tries,
+            meta,
+            extra_data.txn_number_before.as_usize() + i,
+        )?;
+    }
 
     let mut delta_out = apply_deltas_to_trie_state(
         curr_block_tries,
@@ -538,29 +574,44 @@ fn process_txn_info(
     let tries = create_minimal_partial_tries_needed_by_txn(
         &tries_at_start_of_txn,
         &nodes_used_by_txn,
-        txn_idx,
+        txn_range,
         delta_out,
     )?;
 
+    let burn_addr = match use_burn_target {
+        // TODO: https://github.com/0xPolygonZero/zk_evm/issues/565
+        //       Retrieve the actual burn address from `cdk-erigon`.
+        true => Some(H160::zero()),
+        false => None,
+    };
     let gen_inputs = GenerationInputs {
         txn_number_before: extra_data.txn_number_before,
+        burn_addr,
         gas_used_before: extra_data.gas_used_before,
         gas_used_after: extra_data.gas_used_after,
-        signed_txn: txn_info.meta.txn_bytes,
+        signed_txns: txn_info
+            .meta
+            .iter()
+            .filter_map(|t| t.txn_bytes.clone())
+            .collect::<Vec<_>>(),
         withdrawals: Vec::default(), /* Only ever set in a dummy txn at the end of
                                       * the block (see `[add_withdrawals_to_txns]`
                                       * for more info). */
         tries,
         trie_roots_after: TrieRoots {
-            state_root: curr_block_tries.state.hash(),
-            transactions_root: curr_block_tries.txn.hash(),
-            receipts_root: curr_block_tries.receipt.hash(),
+            state_root: curr_block_tries.state.clone().try_into()?.hash(),
+            transactions_root: curr_block_tries.txn.root(),
+            receipts_root: curr_block_tries.receipt.root(),
         },
         checkpoint_state_trie_root: extra_data.checkpoint_state_trie_root,
-        contract_code: txn_info.contract_code_accessed,
+        contract_code: txn_info
+            .contract_code_accessed
+            .into_iter()
+            .map(|code| (hash(&code), code))
+            .collect(),
         block_metadata: other_data.b_data.b_meta.clone(),
         block_hashes: other_data.b_data.b_hashes.clone(),
-        global_exit_roots: vec![],
+        ger_data: None,
     };
 
     // After processing a transaction, we update the remaining accumulators
@@ -571,12 +622,12 @@ fn process_txn_info(
     Ok(gen_inputs)
 }
 
-impl StateTrieWrites {
+impl StateWrite {
     fn apply_writes_to_state_node(
         &self,
         state_node: &mut AccountRlp,
         h_addr: &H256,
-        acc_storage_tries: &HashMap<H256, HashedPartialTrie>,
+        acc_storage_tries: &HashMap<H256, StorageTrie>,
     ) -> anyhow::Result<()> {
         let storage_root_hash_change = match self.storage_trie_change {
             false => None,
@@ -585,7 +636,7 @@ impl StateTrieWrites {
                     .get(h_addr)
                     .context(format!("missing account storage trie {:x}", h_addr))?;
 
-                Some(storage_trie.hash())
+                Some(storage_trie.root())
             }
         };
 
@@ -598,29 +649,15 @@ impl StateTrieWrites {
     }
 }
 
-fn create_minimal_state_partial_trie(
-    state_trie: &HashedPartialTrie,
-    state_accesses: impl Iterator<Item = H256>,
-    additional_state_trie_paths_to_not_hash: impl Iterator<Item = Nibbles>,
-) -> anyhow::Result<HashedPartialTrie> {
-    create_trie_subset_wrapped(
-        state_trie,
-        state_accesses
-            .into_iter()
-            .map(Nibbles::from_h256_be)
-            .chain(additional_state_trie_paths_to_not_hash),
-        TrieType::State,
-    )
-}
-
 // TODO!!!: We really need to be appending the empty storage tries to the base
 // trie somewhere else! This is a big hack!
 fn create_minimal_storage_partial_tries<'a>(
-    storage_tries: &HashMap<H256, HashedPartialTrie>,
-    accesses_per_account: impl Iterator<Item = &'a (H256, Vec<Nibbles>)>,
-    additional_storage_trie_paths_to_not_hash: &HashMap<H256, Vec<Nibbles>>,
+    storage_tries: &HashMap<H256, StorageTrie>,
+    accesses_per_account: impl IntoIterator<Item = (&'a H256, &'a Vec<TrieKey>)>,
+    additional_storage_trie_paths_to_not_hash: &HashMap<H256, Vec<TrieKey>>,
 ) -> anyhow::Result<Vec<(H256, HashedPartialTrie)>> {
     accesses_per_account
+        .into_iter()
         .map(|(h_addr, mem_accesses)| {
             // Guaranteed to exist due to calling `init_any_needed_empty_storage_tries`
             // earlier on.
@@ -634,7 +671,7 @@ fn create_minimal_storage_partial_tries<'a>(
             );
 
             let partial_storage_trie = create_trie_subset_wrapped(
-                base_storage_trie,
+                base_storage_trie.as_hashed_partial_trie(),
                 storage_slots_to_not_hash,
                 TrieType::Storage,
             )?;
@@ -646,57 +683,23 @@ fn create_minimal_storage_partial_tries<'a>(
 
 fn create_trie_subset_wrapped(
     trie: &HashedPartialTrie,
-    accesses: impl IntoIterator<Item = Nibbles>,
+    accesses: impl IntoIterator<Item = TrieKey>,
     trie_type: TrieType,
 ) -> anyhow::Result<HashedPartialTrie> {
-    mpt_trie::trie_subsets::create_trie_subset(trie, accesses)
-        .context(format!("missing keys when creating {}", trie_type))
-}
-
-fn account_from_rlped_bytes(bytes: &[u8]) -> anyhow::Result<AccountRlp> {
-    Ok(rlp::decode(bytes)?)
-}
-
-impl TxnMetaState {
-    /// Outputs a boolean indicating whether this `TxnMetaState`
-    /// represents a dummy payload or an actual transaction.
-    const fn is_dummy(&self) -> bool {
-        self.txn_bytes.is_none()
-    }
-
-    fn txn_bytes(&self) -> Vec<u8> {
-        match self.txn_bytes.as_ref() {
-            Some(v) => v.clone(),
-            None => Vec::default(),
-        }
-    }
-}
-
-fn eth_to_gwei(eth: U256) -> U256 {
-    // 1 ether = 10^9 gwei.
-    eth * U256::from(10).pow(9.into())
+    mpt_trie::trie_subsets::create_trie_subset(
+        trie,
+        accesses.into_iter().map(TrieKey::into_nibbles),
+    )
+    .context(format!("missing keys when creating {}", trie_type))
 }
 
 // This is just `rlp(0)`.
 const ZERO_STORAGE_SLOT_VAL_RLPED: [u8; 1] = [128];
 
-/// Formatting aid for error context.
-struct CustomFmt<T>(T);
-
-impl fmt::Display for CustomFmt<U512> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = [0u8; 64];
-        self.0.to_big_endian(&mut buf);
-        f.write_fmt(format_args!("{} (hashed: 0x{:064X})", self.0, hash(buf)))
-    }
-}
-
 /// Aid for error context.
-/// Covers all Ethereum trie types (see <https://ethereum.github.io/yellowpaper/paper.pdf> for details).
 #[derive(Debug, strum::Display)]
 #[allow(missing_docs)]
-pub enum TrieType {
-    State,
+enum TrieType {
     Storage,
     Receipt,
     Txn,

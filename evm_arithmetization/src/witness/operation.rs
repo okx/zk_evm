@@ -1,7 +1,7 @@
 use ethereum_types::{BigEndianHash, U256};
 use itertools::Itertools;
 use keccak_hash::keccak;
-use plonky2::field::types::Field;
+use plonky2::hash::hash_types::RichField;
 
 use super::state::KERNEL_CONTEXT;
 use super::transition::Transition;
@@ -40,6 +40,10 @@ pub(crate) enum Operation {
     BinaryArithmetic(arithmetic::BinaryOperator),
     TernaryArithmetic(arithmetic::TernaryOperator),
     KeccakGeneral,
+    #[cfg(feature = "cdk_erigon")]
+    Poseidon,
+    #[cfg(feature = "cdk_erigon")]
+    PoseidonGeneral,
     ProverInput,
     Pop,
     Jump,
@@ -66,7 +70,7 @@ pub(crate) const CONTEXT_SCALING_FACTOR: usize = 64;
 /// operation. Generates a new logic operation and adds it to the vector of
 /// operation in `LogicStark`. Adds three memory read operations to
 /// `MemoryStark`: for the two inputs and the output.
-pub(crate) fn generate_binary_logic_op<F: Field, T: Transition<F>>(
+pub(crate) fn generate_binary_logic_op<F: RichField, T: Transition<F>>(
     op: logic::Op,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -84,7 +88,7 @@ pub(crate) fn generate_binary_logic_op<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_binary_arithmetic_op<F: Field, T: Transition<F>>(
+pub(crate) fn generate_binary_arithmetic_op<F: RichField, T: Transition<F>>(
     operator: arithmetic::BinaryOperator,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -115,7 +119,7 @@ pub(crate) fn generate_binary_arithmetic_op<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_ternary_arithmetic_op<F: Field, T: Transition<F>>(
+pub(crate) fn generate_ternary_arithmetic_op<F: RichField, T: Transition<F>>(
     operator: arithmetic::TernaryOperator,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -134,7 +138,7 @@ pub(crate) fn generate_ternary_arithmetic_op<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_keccak_general<F: Field, T: Transition<F>>(
+pub(crate) fn generate_keccak_general<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -159,7 +163,6 @@ pub(crate) fn generate_keccak_general<F: Field, T: Transition<F>>(
     push_no_write(generation_state, hash.into_uint());
 
     state.log_debug(format!("Hashing {:?}", input));
-
     keccak_sponge_log(state, base_address, input);
 
     state.push_memory(log_in1);
@@ -167,7 +170,95 @@ pub(crate) fn generate_keccak_general<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_prover_input<F: Field, T: Transition<F>>(
+#[cfg(feature = "cdk_erigon")]
+/// Pops 3 elements `x,y,z` from the stack, and returns `Poseidon(x || y ||
+/// z)[0..4]`, where values are split into 64-bit limbs, and `z` is used as the
+/// capacity. Limbs are range-checked to be in canonical form in the
+/// PoseidonStark.
+pub(crate) fn generate_poseidon<F: RichField, T: Transition<F>>(
+    state: &mut T,
+    mut row: CpuColumnsView<F>,
+) -> Result<(), ProgramError> {
+    use crate::poseidon::poseidon_stark::{PoseidonOp, PoseidonSimpleOp};
+
+    let generation_state = state.get_mut_generation_state();
+    let [(x, _), (y, log_in1), (z, log_in2)] =
+        stack_pop_with_log_and_fill::<3, _>(generation_state, &mut row)?;
+    let arr = [
+        x.0[0], x.0[1], x.0[2], x.0[3], y.0[0], y.0[1], y.0[2], y.0[3], z.0[0], z.0[1], z.0[2],
+        z.0[3],
+    ]
+    .map(F::from_canonical_u64);
+    let hash = F::poseidon(arr);
+    let hash = U256(std::array::from_fn(|i| hash[i].to_canonical_u64()));
+    log::debug!("Poseidon hashing {:?} -> {}", arr, hash);
+    push_no_write(generation_state, hash);
+
+    state.push_poseidon(PoseidonOp::PoseidonSimpleOp(PoseidonSimpleOp(arr)));
+
+    state.push_memory(log_in1);
+    state.push_memory(log_in2);
+    state.push_cpu(row);
+    Ok(())
+}
+
+#[cfg(feature = "cdk_erigon")]
+pub(crate) fn generate_poseidon_general<F: RichField, T: Transition<F>>(
+    state: &mut T,
+    mut row: CpuColumnsView<F>,
+) -> Result<(), ProgramError> {
+    use smt_trie::{code::poseidon_hash_padded_byte_vec, utils::hashout2u};
+
+    use crate::{
+        cpu::membus::NUM_CHANNELS,
+        poseidon::poseidon_stark::{PoseidonGeneralOp, PoseidonOp},
+    };
+
+    let clock = state.get_clock();
+    let generation_state = state.get_mut_generation_state();
+    let [(addr, _), (len, log_in1)] =
+        stack_pop_with_log_and_fill::<2, _>(generation_state, &mut row)?;
+    let len = u256_to_usize(len)?;
+
+    let base_address = MemoryAddress::new_bundle(addr)?;
+    let input = (0..len)
+        .map(|i| {
+            let address = MemoryAddress {
+                virt: base_address.virt.saturating_add(i),
+                ..base_address
+            };
+            let val = generation_state.memory.get_with_init(address);
+            generation_state.traces.memory_ops.push(MemoryOp::new(
+                MemoryChannel::Code,
+                clock,
+                address,
+                MemoryOpKind::Read,
+                val.0[0].into(),
+            ));
+
+            val.0[0] as u8
+        })
+        .collect_vec();
+
+    let poseidon_op = PoseidonOp::PoseidonGeneralOp(PoseidonGeneralOp {
+        base_address,
+        timestamp: clock * NUM_CHANNELS,
+        input: input.clone(),
+        len: input.len(),
+    });
+
+    let hash = hashout2u(poseidon_hash_padded_byte_vec(input.clone()));
+
+    push_no_write(generation_state, hash);
+
+    state.push_poseidon(poseidon_op);
+
+    state.push_memory(log_in1);
+    state.push_cpu(row);
+    Ok(())
+}
+
+pub(crate) fn generate_prover_input<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -195,7 +286,7 @@ pub(crate) fn generate_prover_input<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_pop<F: Field, T: Transition<F>>(
+pub(crate) fn generate_pop<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -218,7 +309,7 @@ pub(crate) fn generate_pop<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_pc<F: Field, T: Transition<F>>(
+pub(crate) fn generate_pc<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -231,7 +322,7 @@ pub(crate) fn generate_pc<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_jumpdest<F: Field, T: Transition<F>>(
+pub(crate) fn generate_jumpdest<F: RichField, T: Transition<F>>(
     state: &mut T,
     row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -239,7 +330,7 @@ pub(crate) fn generate_jumpdest<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_get_context<F: Field, T: Transition<F>>(
+pub(crate) fn generate_get_context<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -275,7 +366,7 @@ pub(crate) fn generate_get_context<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_set_context<F: Field, T: Transition<F>>(
+pub(crate) fn generate_set_context<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -287,6 +378,9 @@ pub(crate) fn generate_set_context<F: Field, T: Transition<F>>(
     let old_ctx = generation_state.registers.context;
     // The popped value needs to be scaled down.
     let new_ctx = u256_to_usize(ctx >> CONTEXT_SCALING_FACTOR)?;
+
+    // Flag indicating whether the old context should be pruned.
+    let flag = ctx & 1.into();
 
     let sp_field = ContextMetadata::StackSize.unscale();
     let old_sp_addr = MemoryAddress::new(old_ctx, Segment::ContextMetadata, sp_field);
@@ -308,9 +402,6 @@ pub(crate) fn generate_set_context<F: Field, T: Transition<F>>(
         );
         (sp_to_save, op)
     } else {
-        // Even though we might be in the interpreter, `Stack` is not part of the
-        // preinitialized segments, so we don't need to carry out the additional checks
-        // when get the value from memory.
         mem_read_with_log(GeneralPurpose(2), new_sp_addr, generation_state)
     };
 
@@ -343,6 +434,11 @@ pub(crate) fn generate_set_context<F: Field, T: Transition<F>>(
         None
     };
 
+    if flag == 1.into() {
+        row.general.context_pruning_mut().pruning_flag = F::ONE;
+        generation_state.stale_contexts.push(old_ctx);
+    }
+
     generation_state.registers.context = new_ctx;
     generation_state.registers.stack_len = new_sp;
     if let Some(mem_op) = log_read_new_top {
@@ -355,7 +451,7 @@ pub(crate) fn generate_set_context<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_push<F: Field, T: Transition<F>>(
+pub(crate) fn generate_push<F: RichField, T: Transition<F>>(
     n: u8,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -406,7 +502,7 @@ pub(crate) fn generate_push<F: Field, T: Transition<F>>(
 // - Update `stack_top` with `val` and add 1 to `stack_len`
 // Since the write must happen before the read, the normal way of assigning
 // GP channels doesn't work and we must handle them manually.
-pub(crate) fn generate_dup<F: Field, T: Transition<F>>(
+pub(crate) fn generate_dup<F: RichField, T: Transition<F>>(
     n: u8,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -462,9 +558,6 @@ pub(crate) fn generate_dup<F: Field, T: Transition<F>>(
 
         (stack_top, op)
     } else {
-        // Even though we might be in the interpreter, `Stack` is not part of the
-        // preinitialized segments, so we don't need to carry out the additional checks
-        // when get the value from memory.
         mem_read_gp_with_log_and_fill(2, other_addr, generation_state, &mut row)
     };
     push_no_write(generation_state, val);
@@ -474,7 +567,7 @@ pub(crate) fn generate_dup<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_swap<F: Field, T: Transition<F>>(
+pub(crate) fn generate_swap<F: RichField, T: Transition<F>>(
     n: u8,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -492,9 +585,7 @@ pub(crate) fn generate_swap<F: Field, T: Transition<F>>(
     );
 
     let [(in0, _)] = stack_pop_with_log_and_fill::<1, _>(generation_state, &mut row)?;
-    // Even though we might be in the interpreter, `Stack` is not part of the
-    // preinitialized segments, so we don't need to carry out the additional checks
-    // when get the value from memory.
+
     let (in1, log_in1) = mem_read_gp_with_log_and_fill(1, other_addr, generation_state, &mut row);
     let log_out0 = mem_write_gp_log_and_fill(2, other_addr, generation_state, &mut row, in0);
     push_no_write(generation_state, in1);
@@ -505,7 +596,7 @@ pub(crate) fn generate_swap<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_not<F: Field, T: Transition<F>>(
+pub(crate) fn generate_not<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -529,7 +620,7 @@ pub(crate) fn generate_not<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_iszero<F: Field, T: Transition<F>>(
+pub(crate) fn generate_iszero<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -548,7 +639,7 @@ pub(crate) fn generate_iszero<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-fn append_shift<F: Field, T: Transition<F>>(
+fn append_shift<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
     is_shl: bool,
@@ -561,13 +652,9 @@ fn append_shift<F: Field, T: Transition<F>>(
     const LOOKUP_CHANNEL: usize = 2;
     let lookup_addr = MemoryAddress::new(0, Segment::ShiftTable, input0.low_u32() as usize);
     let read_op = if input0.bits() <= 32 {
-        // Even though we might be in the interpreter, `ShiftTable` is not part of the
-        // preinitialized segments, so we don't need to carry out the additional checks
-        // when get the value from memory.
         let (_, read) =
             mem_read_gp_with_log_and_fill(LOOKUP_CHANNEL, lookup_addr, generation_state, &mut row);
         Some(read)
-        // state.push_memory(read);
     } else {
         // The shift constraints still expect the address to be set, even though no read
         // will occur.
@@ -599,7 +686,7 @@ fn append_shift<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_shl<F: Field, T: Transition<F>>(
+pub(crate) fn generate_shl<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -615,7 +702,7 @@ pub(crate) fn generate_shl<F: Field, T: Transition<F>>(
     append_shift(state, row, true, input0, input1, log_in1, result)
 }
 
-pub(crate) fn generate_shr<F: Field, T: Transition<F>>(
+pub(crate) fn generate_shr<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -630,7 +717,7 @@ pub(crate) fn generate_shr<F: Field, T: Transition<F>>(
     append_shift(state, row, false, input0, input1, log_in1, result)
 }
 
-pub(crate) fn generate_syscall<F: Field, T: Transition<F>>(
+pub(crate) fn generate_syscall<F: RichField, T: Transition<F>>(
     opcode: u8,
     stack_values_read: usize,
     stack_len_increased: bool,
@@ -663,9 +750,7 @@ pub(crate) fn generate_syscall<F: Field, T: Transition<F>>(
                 virt: base_address.virt + i,
                 ..base_address
             };
-            // Even though we might be in the interpreter, `Code` is not part of the
-            // preinitialized segments, so we don't need to carry out the additional checks
-            // when get the value from memory.
+
             let val = generation_state.memory.get_with_init(address);
             val.low_u32() as u8
         })
@@ -723,7 +808,7 @@ pub(crate) fn generate_syscall<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_eq<F: Field, T: Transition<F>>(
+pub(crate) fn generate_eq<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -741,7 +826,7 @@ pub(crate) fn generate_eq<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_exit_kernel<F: Field, T: Transition<F>>(
+pub(crate) fn generate_exit_kernel<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -770,7 +855,7 @@ pub(crate) fn generate_exit_kernel<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_mload_general<F: Field, T: Transition<F>>(
+pub(crate) fn generate_mload_general<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -803,7 +888,7 @@ pub(crate) fn generate_mload_general<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_mload_32bytes<F: Field, T: Transition<F>>(
+pub(crate) fn generate_mload_32bytes<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -843,7 +928,7 @@ pub(crate) fn generate_mload_32bytes<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_mstore_general<F: Field, T: Transition<F>>(
+pub(crate) fn generate_mstore_general<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
@@ -873,7 +958,7 @@ pub(crate) fn generate_mstore_general<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_mstore_32bytes<F: Field, T: Transition<F>>(
+pub(crate) fn generate_mstore_32bytes<F: RichField, T: Transition<F>>(
     n: u8,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -893,7 +978,7 @@ pub(crate) fn generate_mstore_32bytes<F: Field, T: Transition<F>>(
     Ok(())
 }
 
-pub(crate) fn generate_exception<F: Field, T: Transition<F>>(
+pub(crate) fn generate_exception<F: RichField, T: Transition<F>>(
     exc_code: u8,
     state: &mut T,
     mut row: CpuColumnsView<F>,
@@ -946,7 +1031,10 @@ pub(crate) fn generate_exception<F: Field, T: Transition<F>>(
 
     let gas = U256::from(generation_state.registers.gas_used);
 
-    let exc_info = U256::from(generation_state.registers.program_counter) + (gas << 192);
+    // `is_kernel_mode` is only necessary for the halting `exc_stop` exception.
+    let exc_info = U256::from(generation_state.registers.program_counter)
+        + (U256::from(generation_state.registers.is_kernel as u64) << 32)
+        + (gas << 192);
 
     // Get the opcode so we can provide it to the range_check operation.
     let code_context = generation_state.registers.code_context();

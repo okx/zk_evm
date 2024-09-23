@@ -1,3 +1,5 @@
+#![cfg(feature = "eth_mainnet")]
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -13,13 +15,12 @@ use evm_arithmetization::generation::mpt::transaction_testing::{
 use evm_arithmetization::generation::mpt::{AccountRlp, LegacyReceiptRlp, LogRlp};
 use evm_arithmetization::generation::{GenerationInputs, TrieInputs};
 use evm_arithmetization::proof::{BlockHashes, BlockMetadata, TrieRoots};
-use evm_arithmetization::prover::prove;
+use evm_arithmetization::prover::testing::prove_all_segments;
 use evm_arithmetization::testing_utils::{
-    beacon_roots_account_nibbles, beacon_roots_contract_from_storage, ger_account_nibbles,
-    init_logger, preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
-    GLOBAL_EXIT_ROOT_ACCOUNT,
+    beacon_roots_account_nibbles, beacon_roots_contract_from_storage, init_logger,
+    preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
 };
-use evm_arithmetization::verifier::verify_proof;
+use evm_arithmetization::verifier::testing::verify_all_proofs;
 use evm_arithmetization::{AllStark, Node, StarkConfig};
 use hex_literal::hex;
 use keccak_hash::keccak;
@@ -162,6 +163,13 @@ fn test_log_opcode() -> anyhow::Result<()> {
 
     // Update the state and receipt tries after the transaction, so that we have the
     // correct expected tries: Update accounts
+    #[cfg(feature = "cdk_erigon")]
+    let beneficiary_account_after = AccountRlp {
+        nonce: 1.into(),
+        balance: block_metadata.block_base_fee * gas_used,
+        ..AccountRlp::default()
+    };
+    #[cfg(not(feature = "cdk_erigon"))]
     let beneficiary_account_after = AccountRlp {
         nonce: 1.into(),
         ..AccountRlp::default()
@@ -226,10 +234,6 @@ fn test_log_opcode() -> anyhow::Result<()> {
         beacon_roots_account_nibbles(),
         rlp::encode(&beacon_roots_account).to_vec(),
     )?;
-    expected_state_trie_after.insert(
-        ger_account_nibbles(),
-        rlp::encode(&GLOBAL_EXIT_ROOT_ACCOUNT).to_vec(),
-    )?;
 
     let transactions_trie: HashedPartialTrie = Node::Leaf {
         nibbles: Nibbles::from_str("0x80").unwrap(),
@@ -243,10 +247,16 @@ fn test_log_opcode() -> anyhow::Result<()> {
         receipts_root: receipts_trie.hash(),
     };
 
+    let burn_addr = match cfg!(feature = "cdk_erigon") {
+        true => Some(Address::from(beneficiary)),
+        false => None,
+    };
+
     let inputs = GenerationInputs {
-        signed_txn: Some(txn.to_vec()),
+        signed_txns: vec![txn.to_vec()],
+        burn_addr,
         withdrawals: vec![],
-        global_exit_roots: vec![],
+        ger_data: None,
         tries: tries_before,
         trie_roots_after,
         contract_code,
@@ -262,22 +272,21 @@ fn test_log_opcode() -> anyhow::Result<()> {
         },
     };
 
+    let max_cpu_len_log = 20;
     let mut timing = TimingTree::new("prove", log::Level::Debug);
-    let proof = prove::<F, C, D>(&all_stark, &config, inputs, &mut timing, None)?;
+
+    let proofs = prove_all_segments::<F, C, D>(
+        &all_stark,
+        &config,
+        inputs,
+        max_cpu_len_log,
+        &mut timing,
+        None,
+    )?;
+
     timing.filter(Duration::from_millis(100)).print();
 
-    // Assert that the proof leads to the correct state and receipt roots.
-    assert_eq!(
-        proof.public_values.trie_roots_after.state_root,
-        expected_state_trie_after.hash()
-    );
-
-    assert_eq!(
-        proof.public_values.trie_roots_after.receipts_root,
-        receipts_trie.hash()
-    );
-
-    verify_proof(&all_stark, proof, &config)
+    verify_all_proofs(&all_stark, &proofs, &config)
 }
 
 /// Values taken from the block 1000000 of Goerli: https://goerli.etherscan.io/txs?block=1000000

@@ -1,17 +1,17 @@
+#![cfg(feature = "eth_mainnet")]
+
 #[cfg(feature="cuda")]
 use cryptography_cuda::init_cuda_rs;
 
-use env_logger::{try_init_from_env, Env, DEFAULT_FILTER_ENV};
 use ethereum_types::{Address, BigEndianHash, H256};
 use evm_arithmetization::fixed_recursive_verifier::{
-    extract_block_public_values, extract_two_to_one_block_hash,
+    extract_block_final_public_values, extract_two_to_one_block_hash,
 };
 use evm_arithmetization::generation::{GenerationInputs, TrieInputs};
-use evm_arithmetization::proof::{BlockMetadata, PublicValues, TrieRoots};
+use evm_arithmetization::proof::{BlockMetadata, FinalPublicValues, PublicValues, TrieRoots};
 use evm_arithmetization::testing_utils::{
-    beacon_roots_account_nibbles, beacon_roots_contract_from_storage, ger_account_nibbles,
+    beacon_roots_account_nibbles, beacon_roots_contract_from_storage, init_logger,
     preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
-    GLOBAL_EXIT_ROOT_ACCOUNT,
 };
 use evm_arithmetization::{AllRecursiveCircuits, AllStark, Node, StarkConfig};
 use hex_literal::hex;
@@ -25,10 +25,6 @@ use plonky2::util::timing::TimingTree;
 type F = GoldilocksField;
 const D: usize = 2;
 type C = PoseidonGoldilocksConfig;
-
-fn init_logger() {
-    let _ = try_init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info"));
-}
 
 /// Get `GenerationInputs` for a dummy payload, where the block has the given
 /// timestamp.
@@ -81,10 +77,6 @@ fn dummy_payload(timestamp: u64, is_first_payload: bool) -> anyhow::Result<Gener
             beacon_roots_account_nibbles(),
             rlp::encode(&updated_beacon_roots_account).to_vec(),
         )?;
-        state_trie_after.insert(
-            ger_account_nibbles(),
-            rlp::encode(&GLOBAL_EXIT_ROOT_ACCOUNT).to_vec(),
-        )?;
 
         state_trie_after
     };
@@ -97,6 +89,7 @@ fn dummy_payload(timestamp: u64, is_first_payload: bool) -> anyhow::Result<Gener
 
     let inputs = GenerationInputs {
         tries: tries_before.clone(),
+        burn_addr: None,
         trie_roots_after,
         checkpoint_state_trie_root,
         block_metadata,
@@ -116,42 +109,62 @@ fn get_test_block_proof(
     let dummy1 = dummy_payload(timestamp, false)?;
 
     let timing = &mut TimingTree::new(&format!("Blockproof {timestamp}"), log::Level::Info);
-    let (dummy_proof0, dummy_pv0) =
-        all_circuits.prove_root(all_stark, config, dummy0, timing, None)?;
-    all_circuits.verify_root(dummy_proof0.clone())?;
-    let (dummy_proof1, dummy_pv1) =
-        all_circuits.prove_root(all_stark, config, dummy1, timing, None)?;
-    all_circuits.verify_root(dummy_proof1.clone())?;
+    let dummy0_proof0 =
+        all_circuits.prove_all_segments(all_stark, config, dummy0, 20, timing, None)?;
+    let dummy1_proof =
+        all_circuits.prove_all_segments(all_stark, config, dummy1, 20, timing, None)?;
 
-    let (agg_proof0, pv0) = all_circuits.prove_aggregation(
+    let inputs0_proof = all_circuits.prove_segment_aggregation(
         false,
-        &dummy_proof0,
-        dummy_pv0,
+        &dummy0_proof0[0],
         false,
-        &dummy_proof1,
-        dummy_pv1,
+        &dummy0_proof0[1],
+    )?;
+    let dummy0_proof =
+        all_circuits.prove_segment_aggregation(false, &dummy1_proof[0], false, &dummy1_proof[1])?;
+
+    let (agg_proof, pv) = all_circuits.prove_transaction_aggregation(
+        false,
+        &inputs0_proof.proof_with_pis,
+        inputs0_proof.public_values,
+        false,
+        &dummy0_proof.proof_with_pis,
+        dummy0_proof.public_values,
     )?;
 
-    all_circuits.verify_aggregation(&agg_proof0)?;
+    all_circuits.verify_txn_aggregation(&agg_proof)?;
 
     // Test retrieved public values from the proof public inputs.
-    let retrieved_public_values0 = PublicValues::from_public_inputs(&agg_proof0.public_inputs);
-    assert_eq!(retrieved_public_values0, pv0);
+    let retrieved_public_values = PublicValues::from_public_inputs(&agg_proof.public_inputs);
+    assert_eq!(retrieved_public_values, pv);
     assert_eq!(
-        pv0.trie_roots_before.state_root,
-        pv0.extra_block_data.checkpoint_state_trie_root
+        pv.trie_roots_before.state_root,
+        pv.extra_block_data.checkpoint_state_trie_root
     );
 
-    let (block_proof0, block_public_values) = all_circuits.prove_block(
+    let (block_proof, block_public_values) = all_circuits.prove_block(
         None, // We don't specify a previous proof, considering block 1 as the new checkpoint.
-        &agg_proof0,
-        pv0.clone(),
+        &agg_proof,
+        pv.clone(),
     )?;
 
-    let pv_block = PublicValues::from_public_inputs(&block_proof0.public_inputs);
-    assert_eq!(block_public_values, pv_block);
+    all_circuits.verify_block(&block_proof)?;
 
-    Ok(block_proof0)
+    // Test retrieved public values from the proof public inputs.
+    let retrieved_public_values = PublicValues::from_public_inputs(&block_proof.public_inputs);
+    assert_eq!(retrieved_public_values, block_public_values);
+
+    let (wrapped_block_proof, block_final_public_values) =
+        all_circuits.prove_block_wrapper(&block_proof, block_public_values)?;
+
+    // Test retrieved final public values from the proof public inputs.
+    let retrieved_final_public_values =
+        FinalPublicValues::from_public_inputs(&wrapped_block_proof.public_inputs);
+    assert_eq!(retrieved_final_public_values, block_final_public_values);
+
+    all_circuits.verify_block_wrapper(&wrapped_block_proof)?;
+
+    Ok(wrapped_block_proof)
 }
 
 #[ignore]
@@ -166,22 +179,27 @@ fn test_two_to_one_block() -> anyhow::Result<()> {
 
     let all_stark = AllStark::<F, D>::default();
     let config = StarkConfig::standard_fast_config();
+
     let all_circuits = AllRecursiveCircuits::<F, C, D>::new(
         &all_stark,
-        &[16..17, 8..10, 14..15, 14..15, 9..10, 12..13, 17..18],
+        &[
+            16..17,
+            8..9,
+            12..13,
+            9..10,
+            8..9,
+            6..7,
+            17..18,
+            17..18,
+            7..8,
+        ],
         &config,
     );
 
-    let unrelated_block_proofs = some_timestamps
+    let bp = some_timestamps
         .iter()
         .map(|&ts| get_test_block_proof(ts, &all_circuits, &all_stark, &config))
         .collect::<anyhow::Result<Vec<ProofWithPublicInputs<F, C, D>>>>()?;
-
-    unrelated_block_proofs
-        .iter()
-        .try_for_each(|bp| all_circuits.verify_block(bp))?;
-
-    let bp = unrelated_block_proofs;
 
     {
         // Aggregate the same proof twice
@@ -214,7 +232,8 @@ fn test_two_to_one_block() -> anyhow::Result<()> {
             let mut hashes: Vec<_> = bp
                 .iter()
                 .map(|block_proof| {
-                    let public_values = extract_block_public_values(&block_proof.public_inputs);
+                    let public_values =
+                        extract_block_final_public_values(&block_proof.public_inputs);
                     PoseidonHash::hash_no_pad(public_values)
                 })
                 .collect();

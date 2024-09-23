@@ -1,93 +1,68 @@
+use std::sync::Arc;
+
 use alloy::{
-    primitives::B256,
+    primitives::{Bytes, FixedBytes, B256},
     providers::Provider,
-    rpc::types::eth::{BlockId, BlockNumberOrTag, BlockTransactionsKind, Withdrawal},
+    rpc::types::eth::{BlockId, BlockTransactionsKind, Withdrawal},
     transports::Transport,
 };
-use anyhow::Context as _;
+use anyhow::{anyhow, Context as _};
 use clap::ValueEnum;
 use compat::Compat;
 use evm_arithmetization::proof::{BlockHashes, BlockMetadata};
 use futures::{StreamExt as _, TryStreamExt as _};
-use prover::ProverInput;
+use prover::BlockProverInput;
+use serde_json::json;
 use trace_decoder::{BlockLevelData, OtherBlockData};
-use zero_bin_common::block_interval::BlockInterval;
+use tracing::warn;
 
 pub mod jerigon;
 pub mod native;
-pub mod provider;
 pub mod retry;
 
-use crate::provider::CachedProvider;
+use zero_bin_common::provider::CachedProvider;
+
+pub(crate) type PreviousBlockHashes = [FixedBytes<32>; 256];
 
 const PREVIOUS_HASHES_COUNT: usize = 256;
 
 /// The RPC type.
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, Copy)]
 pub enum RpcType {
     Jerigon,
     Native,
 }
 
-/// Obtain the prover input for a given block interval
-pub async fn prover_input<ProviderT, TransportT>(
-    cached_provider: &CachedProvider<ProviderT, TransportT>,
-    block_interval: BlockInterval,
-    checkpoint_block_id: BlockId,
+/// Obtain the prover input for one block
+pub async fn block_prover_input<ProviderT, TransportT>(
+    cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
+    block_id: BlockId,
+    checkpoint_state_trie_root: B256,
     rpc_type: RpcType,
-) -> anyhow::Result<ProverInput>
+) -> Result<BlockProverInput, anyhow::Error>
 where
     ProviderT: Provider<TransportT>,
     TransportT: Transport + Clone,
 {
-    // Grab interval checkpoint block state trie
-    let checkpoint_state_trie_root = cached_provider
-        .get_block(checkpoint_block_id, BlockTransactionsKind::Hashes)
-        .await?
-        .header
-        .state_root;
-
-    let mut block_proofs = Vec::new();
-    let mut block_interval = block_interval.into_bounded_stream()?;
-
-    while let Some(block_num) = block_interval.next().await {
-        let block_id = BlockId::Number(BlockNumberOrTag::Number(block_num));
-        let block_prover_input = match rpc_type {
-            RpcType::Jerigon => {
-                jerigon::block_prover_input(cached_provider, block_id, checkpoint_state_trie_root)
-                    .await?
-            }
-            RpcType::Native => {
-                native::block_prover_input(cached_provider, block_id, checkpoint_state_trie_root)
-                    .await?
-            }
-        };
-
-        block_proofs.push(block_prover_input);
+    match rpc_type {
+        RpcType::Jerigon => {
+            jerigon::block_prover_input(cached_provider, block_id, checkpoint_state_trie_root).await
+        }
+        RpcType::Native => {
+            native::block_prover_input(cached_provider, block_id, checkpoint_state_trie_root).await
+        }
     }
-    Ok(ProverInput {
-        blocks: block_proofs,
-    })
 }
 
-/// Fetches other block data
-async fn fetch_other_block_data<ProviderT, TransportT>(
-    cached_provider: &CachedProvider<ProviderT, TransportT>,
-    target_block_id: BlockId,
-    checkpoint_state_trie_root: B256,
-) -> anyhow::Result<OtherBlockData>
+async fn fetch_previous_block_hashes_from_block<ProviderT, TransportT>(
+    cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
+    target_block_number: u64,
+) -> anyhow::Result<PreviousBlockHashes>
 where
     ProviderT: Provider<TransportT>,
     TransportT: Transport + Clone,
 {
-    let target_block = cached_provider
-        .get_block(target_block_id, BlockTransactionsKind::Hashes)
-        .await?;
-    let target_block_number = target_block
-        .header
-        .number
-        .context("target block is missing field `number`")?;
-    let chain_id = cached_provider.as_provider().get_chain_id().await?;
+    use itertools::Itertools;
 
     // For one block, we will fetch 128 previous blocks to get hashes instead of
     // 256. But for two consecutive blocks (odd and even) we would fetch 256
@@ -102,28 +77,33 @@ where
         })
         .take(PREVIOUS_HASHES_COUNT + 1)
         .filter(|i| *i >= 0)
+        .chunks(2)
+        .into_iter()
+        .map(|mut chunk| {
+            // We convert to tuple of (current block, optional previous block)
+            let first = chunk
+                .next()
+                .expect("must be valid according to itertools::Iterator::chunks definition");
+            let second = chunk.next();
+            (first, second)
+        })
         .collect::<Vec<_>>();
+
     let concurrency = previous_block_numbers.len();
     let collected_hashes = futures::stream::iter(
         previous_block_numbers
-            .chunks(2) // we get hash for previous and current block with one request
-            .map(|block_numbers| {
+            .into_iter() // we get hash for previous and current block with one request
+            .map(|(current_block_number, previous_block_number)| {
                 let cached_provider = &cached_provider;
-                let block_num = &block_numbers[0];
-                let previos_block_num = if block_numbers.len() > 1 {
-                    Some(block_numbers[1])
-                } else {
-                    // For genesis block
-                    None
-                };
+                let block_num = current_block_number;
                 async move {
                     let block = cached_provider
-                        .get_block((*block_num as u64).into(), BlockTransactionsKind::Hashes)
+                        .get_block((block_num as u64).into(), BlockTransactionsKind::Hashes)
                         .await
                         .context("couldn't get block")?;
                     anyhow::Ok([
-                        (block.header.hash, Some(*block_num)),
-                        (Some(block.header.parent_hash), previos_block_num),
+                        (block.header.hash, Some(block_num)),
+                        (block.header.parent_hash, previous_block_number),
                     ])
                 }
             }),
@@ -140,13 +120,96 @@ where
         .skip(odd_offset as usize)
         .take(PREVIOUS_HASHES_COUNT)
         .for_each(|(hash, block_num)| {
-            if let (Some(hash), Some(block_num)) = (hash, block_num) {
+            if let (hash, Some(block_num)) = (hash, block_num) {
                 // Most recent previous block hash is expected at the end of the array
                 prev_hashes
                     [PREVIOUS_HASHES_COUNT - (target_block_number - block_num as u64) as usize] =
                     hash;
             }
         });
+
+    Ok(prev_hashes)
+}
+
+async fn fetch_previous_block_hashes_smart_contract<ProviderT, TransportT>(
+    cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
+    target_block_number: u64,
+) -> anyhow::Result<PreviousBlockHashes>
+where
+    ProviderT: Provider<TransportT>,
+    TransportT: Transport + Clone,
+{
+    // Here, we perform the `eth_call` to the node to get the previous
+    // block hashes (read-only execution). We set the target address to be
+    // empty, hence the node executes this call as a contract creation function.
+    // We use that execution not to produce a new contract bytecode - instead, we
+    // return hashes. To look at the code use `cast disassemble <bytecode>`.
+    let bytes = cached_provider
+        .get_provider()
+        .await?
+        .raw_request::<_, Bytes>(
+            "eth_call".into(),
+            (
+                json!({"data": "0x60005B60010180430340816020025280610101116300000002576120205FF3"}),
+                &format!("{:#x}", target_block_number),
+            ),
+        )
+        .await?;
+
+    let prev_hashes = bytes
+        .chunks(32)
+        .skip(1) // blockhash for current block
+        .map(FixedBytes::<32>::try_from)
+        .rev()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    PreviousBlockHashes::try_from(prev_hashes)
+        .map_err(|_| anyhow!("invalid conversion to 256 previous block hashes"))
+}
+
+async fn fetch_previous_block_hashes<ProviderT, TransportT>(
+    cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
+    target_block_number: u64,
+) -> anyhow::Result<PreviousBlockHashes>
+where
+    ProviderT: Provider<TransportT>,
+    TransportT: Transport + Clone,
+{
+    match fetch_previous_block_hashes_smart_contract(cached_provider.clone(), target_block_number)
+        .await
+    {
+        Ok(prev_block_hahes) => {
+            if !prev_block_hahes.into_iter().all(|it| it.0 == [0u8; 32]) {
+                // Previous hashes valid, return result
+                return Ok(prev_block_hahes);
+            } else {
+                warn!("all retrieved block hashes empty, falling back to `eth_getBlockByNumber` for block {}", target_block_number);
+            }
+        }
+        Err(e) => {
+            warn!("unable to retrieve previous block hashes with `eth_call`: {e}");
+        }
+    }
+
+    fetch_previous_block_hashes_from_block(cached_provider, target_block_number).await
+}
+
+/// Fetches other block data
+async fn fetch_other_block_data<ProviderT, TransportT>(
+    cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
+    target_block_id: BlockId,
+    checkpoint_state_trie_root: B256,
+) -> anyhow::Result<OtherBlockData>
+where
+    ProviderT: Provider<TransportT>,
+    TransportT: Transport + Clone,
+{
+    let target_block = cached_provider
+        .get_block(target_block_id, BlockTransactionsKind::Hashes)
+        .await?;
+    let target_block_number = target_block.header.number;
+    let chain_id = cached_provider.get_provider().await?.get_chain_id().await?;
+    let prev_hashes = fetch_previous_block_hashes(cached_provider, target_block_number).await?;
 
     let other_data = OtherBlockData {
         b_data: BlockLevelData {
@@ -187,11 +250,7 @@ where
             },
             b_hashes: BlockHashes {
                 prev_hashes: prev_hashes.map(|it| it.compat()).into(),
-                cur_hash: target_block
-                    .header
-                    .hash
-                    .context("target block is missing field `hash`")?
-                    .compat(),
+                cur_hash: target_block.header.hash.compat(),
             },
             withdrawals: target_block
                 .withdrawals

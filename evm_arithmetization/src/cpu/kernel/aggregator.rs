@@ -9,7 +9,16 @@ use super::assembler::{assemble, Kernel};
 use crate::cpu::kernel::constants::evm_constants;
 use crate::cpu::kernel::parser::parse;
 
-pub const NUMBER_KERNEL_FILES: usize = 156;
+pub const NUMBER_KERNEL_FILES: usize = if cfg!(feature = "eth_mainnet") {
+    157
+} else if cfg!(feature = "cdk_erigon") {
+    155
+} else if cfg!(feature = "polygon_pos") {
+    154
+} else {
+    // unreachable
+    0
+};
 
 pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     "global jumped_to_0: PANIC",
@@ -45,6 +54,7 @@ pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     include_str!("asm/core/log.asm"),
     include_str!("asm/core/selfdestruct_list.asm"),
     include_str!("asm/core/touched_addresses.asm"),
+    #[cfg(feature = "eth_mainnet")]
     include_str!("asm/core/withdrawals.asm"),
     include_str!("asm/core/precompiles/main.asm"),
     include_str!("asm/core/precompiles/ecrec.asm"),
@@ -56,8 +66,9 @@ pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     include_str!("asm/core/precompiles/bn_mul.asm"),
     include_str!("asm/core/precompiles/snarkv.asm"),
     include_str!("asm/core/precompiles/blake2_f.asm"),
+    #[cfg(feature = "eth_mainnet")]
     include_str!("asm/core/precompiles/kzg_peval.asm"),
-    include_str!("asm/curve/bls381/util.asm"),
+    // include_str!("asm/curve/bls381/util.asm"),
     include_str!("asm/curve/bn254/curve_arithmetic/constants.asm"),
     include_str!("asm/curve/bn254/curve_arithmetic/curve_add.asm"),
     include_str!("asm/curve/bn254/curve_arithmetic/curve_mul.asm"),
@@ -129,6 +140,9 @@ pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     include_str!("asm/mpt/insert/insert_extension.asm"),
     include_str!("asm/mpt/insert/insert_leaf.asm"),
     include_str!("asm/mpt/insert/insert_trie_specific.asm"),
+    include_str!("asm/mpt/linked_list/linked_list.asm"),
+    include_str!("asm/mpt/linked_list/initial_tries.asm"),
+    include_str!("asm/mpt/linked_list/final_tries.asm"),
     include_str!("asm/mpt/read.asm"),
     include_str!("asm/mpt/storage/storage_read.asm"),
     include_str!("asm/mpt/storage/storage_write.asm"),
@@ -161,6 +175,7 @@ pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     include_str!("asm/transactions/type_0.asm"),
     include_str!("asm/transactions/type_1.asm"),
     include_str!("asm/transactions/type_2.asm"),
+    #[cfg(feature = "eth_mainnet")]
     include_str!("asm/transactions/type_3.asm"),
     include_str!("asm/util/assertions.asm"),
     include_str!("asm/util/basic_macros.asm"),
@@ -169,13 +184,26 @@ pub static KERNEL_FILES: [&str; NUMBER_KERNEL_FILES] = [
     include_str!("asm/account_code.asm"),
     include_str!("asm/balance.asm"),
     include_str!("asm/bloom_filter.asm"),
-    include_str!("asm/global_exit_root.asm"),
+    #[cfg(feature = "cdk_erigon")]
+    include_str!("asm/cdk_pre_execution.asm"),
 ];
 
 pub static KERNEL: Lazy<Kernel> = Lazy::new(combined_kernel);
 
 pub(crate) fn combined_kernel_from_files<const N: usize>(files: [&str; N]) -> Kernel {
-    let parsed_files = files.iter().map(|f| parse(f, HashSet::new())).collect_vec();
+    let mut active_features = HashSet::new();
+    if cfg!(feature = "cdk_erigon") {
+        active_features.insert("cdk_erigon");
+    } else if cfg!(feature = "polygon_pos") {
+        active_features.insert("polygon_pos");
+    } else {
+        active_features.insert("eth_mainnet");
+    }
+
+    let parsed_files = files
+        .iter()
+        .map(|f| parse(f, &active_features))
+        .collect_vec();
     assemble(parsed_files, evm_constants(), true)
 }
 
