@@ -8,7 +8,6 @@ use cli::Command;
 use client::RpcParams;
 #[cfg(feature="cuda")]
 use cryptography_cuda::init_cuda_rs;
-use ops::register;
 use paladin::runtime::Runtime;
 use tracing::info;
 use zero::env::load_dotenvy_vars_if_present;

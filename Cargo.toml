@@ -112,19 +112,11 @@ zk_evm_proc_macro = { path = "proc_macro", version = "0.1.0" }
 zero = { path = "zero", default-features = false }
 
 # plonky2-related dependencies
-#plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "27ea4e531979fcf89dbd0a40caaa0c7778e62edb" }
-#plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "27ea4e531979fcf89dbd0a40caaa0c7778e62edb" }
-#plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "27ea4e531979fcf89dbd0a40caaa0c7778e62edb" }
-#starky = { git = "https://github.com/okx/plonky2.git", rev = "27ea4e531979fcf89dbd0a40caaa0c7778e62edb" }
-#cryptography_cuda = { git = "ssh://git@github.com/okx/cryptography_cuda.git", rev = "173510160183f3299f4765b30bd4f2c1685353f9" }
-
-plonky2 = { path = "../plonky2/plonky2" }
-plonky2_util = { path = "../plonky2/util" }
-plonky2_field = { path = "../plonky2/field" }
-plonky2_maybe_rayon = { path = "../plonky2/maybe_rayon" }
-starky = { path = "../plonky2/starky" }
-# cryptography_cuda = { git = "ssh://git@github.com/okx/cryptography_cuda.git", rev = "3d76df99b4446653af6598f2d9a3c2b89b5b769f", features=["cuda"] }
-cryptography_cuda = { path = "../cryptography_cuda" }
+plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
+plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
+plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
+starky = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
+cryptography_cuda = { git = "ssh://git@github.com/okx/cryptography_cuda.git", rev = "36c6e75d26f9771cf09eec91ddc8f0cb152ca4a3" }
 
 # proc macro related dependencies
 proc-macro2 = "1.0"
