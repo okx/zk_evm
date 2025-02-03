@@ -1,5 +1,5 @@
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use evm_arithmetization::cpu::kernel::assemble_to_bytes;

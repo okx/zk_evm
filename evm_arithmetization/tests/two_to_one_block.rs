@@ -1,7 +1,7 @@
 #![cfg(feature = "eth_mainnet")]
 
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use ethereum_types::{Address, BigEndianHash, H256};
 use evm_arithmetization::fixed_recursive_verifier::{

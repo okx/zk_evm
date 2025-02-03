@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use ethereum_types::H256;
 use evm_arithmetization::generation::{GenerationInputs, TrieInputs};

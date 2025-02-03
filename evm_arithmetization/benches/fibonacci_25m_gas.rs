@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use env_logger::{try_init_from_env, Env, DEFAULT_FILTER_ENV};

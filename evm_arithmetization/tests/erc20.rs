@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use ethereum_types::{Address, BigEndianHash, H160, H256, U256};
 use evm_arithmetization::generation::mpt::{AccountRlp, LegacyReceiptRlp, LogRlp};

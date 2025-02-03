@@ -45,7 +45,7 @@ thiserror = { workspace = true }
 tiny-keccak = { workspace = true }
 serde_json = { workspace = true }
 serde-big-array = { workspace = true }
-cryptography_cuda = { workspace = true }
+zeknox = { workspace = true }
 
 # Local dependencies
 mpt_trie = { workspace = true }
@@ -64,7 +64,7 @@ asmtools = ["hex"]
 polygon_pos = []
 cdk_erigon = ["smt_trie"]
 eth_mainnet = []
-cuda = ["plonky2/cuda", "cryptography_cuda/cuda"]
+cuda = ["plonky2/cuda", "zeknox/cuda"]
 
 [[bin]]
 name = "assemble"

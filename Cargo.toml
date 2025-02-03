@@ -112,11 +112,11 @@ zk_evm_proc_macro = { path = "proc_macro", version = "0.1.0" }
 zero = { path = "zero", default-features = false }
 
 # plonky2-related dependencies
-plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
-plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
-plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
-starky = { git = "https://github.com/okx/plonky2.git", rev = "80386f3bdb83dc5387e68873b33549fbc871a4fa" }
-cryptography_cuda = { git = "ssh://git@github.com/okx/cryptography_cuda.git", rev = "36c6e75d26f9771cf09eec91ddc8f0cb152ca4a3" }
+plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
+plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
+plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
+starky = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
+zeknox = { git = "https://github.com/okx/zeknox.git", rev = "500ce15c50d31bd48b466e4571cad2c66bacf368" }
 
 # proc macro related dependencies
 proc-macro2 = "1.0"

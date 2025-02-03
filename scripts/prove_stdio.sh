@@ -38,8 +38,8 @@ export RUST_LOG=info
 # Script users are running locally, and might benefit from extra perf.
 # See also .cargo/config.toml.
 export RUSTFLAGS='-C target-cpu=native -Zlinker-features=-lld'
-# export FEATURES="cuda"
-export FEATURES="default"
+export FEATURES="cuda"
+# export FEATURES="default"
 
 INPUT_FILE=$1
 TEST_ONLY=$2

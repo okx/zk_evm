@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 #[cfg(feature="cuda")]
-use cryptography_cuda::init_cuda_rs;
+use zeknox::init_cuda_rs;
 
 use bytes::Bytes;
 use ethereum_types::{Address, BigEndianHash, H256};
