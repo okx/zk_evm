@@ -2,6 +2,7 @@ use ethereum_types::{BigEndianHash, U256};
 use itertools::Itertools;
 use keccak_hash::keccak;
 use plonky2::hash::hash_types::RichField;
+use serde::{Deserialize, Serialize};
 
 use super::state::KERNEL_CONTEXT;
 use super::transition::Transition;
@@ -29,7 +30,7 @@ use crate::witness::util::{
 };
 use crate::{arithmetic, logic};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Iszero,
     Not,
@@ -207,6 +208,7 @@ pub(crate) fn generate_poseidon_general<F: RichField, T: Transition<F>>(
     state: &mut T,
     mut row: CpuColumnsView<F>,
 ) -> Result<(), ProgramError> {
+    use alloy_compat::Compat;
     use smt_trie::{code::poseidon_hash_padded_byte_vec, utils::hashout2u};
 
     use crate::{
@@ -249,7 +251,7 @@ pub(crate) fn generate_poseidon_general<F: RichField, T: Transition<F>>(
 
     let hash = hashout2u(poseidon_hash_padded_byte_vec(input.clone()));
 
-    push_no_write(generation_state, hash);
+    push_no_write(generation_state, hash.compat());
 
     state.push_poseidon(poseidon_op);
 

@@ -1,28 +1,31 @@
 //! Global prover state management and utilities.
 //!
 //! This module provides the following:
-//! - [`Circuit`] and [`CircuitConfig`] which can be used to dynamically
-//!   construct [`evm_arithmetization::fixed_recursive_verifier::AllRecursiveCircuits`]
-//!   from the specified circuit sizes.
+//! - [`ProverState`] and [`CircuitConfig`] which can be used to dynamically
+//!   construct [`evm_arithmetization::AllRecursiveCircuits`] from the specified
+//!   circuit sizes.
 //! - Command line arguments for constructing a [`CircuitConfig`].
 //!     - Provides default values for the circuit sizes.
 //!     - Allows the circuit sizes to be specified via environment variables.
 //! - Persistence utilities for saving and loading
-//!   [`evm_arithmetization::fixed_recursive_verifier::AllRecursiveCircuits`].
-//! - Global prover state management via the [`P_STATE`] static and the
-//!   [`set_prover_state_from_config`] function.
+//!   [`evm_arithmetization::AllRecursiveCircuits`].
+//! - Global prover state management via the `P_STATE` static and the
+//!   [`p_state`] function.
+use std::borrow::Borrow;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{fmt::Display, sync::OnceLock};
 
 use clap::ValueEnum;
+use evm_arithmetization::testing_utils::TEST_STARK_CONFIG;
 use evm_arithmetization::{
-    fixed_recursive_verifier::ProverOutputData, generation::TrimmedGenerationInputs,
-    proof::AllProof, prover::prove, AllStark, GenerationSegmentData, StarkConfig,
+    fixed_recursive_verifier::ProverOutputData, prover::prove, AllProof, AllRecursiveCircuits,
+    AllStark, GenerationSegmentData, RecursiveCircuitsForTableSize, StarkConfig,
+    TrimmedGenerationInputs,
 };
-use plonky2::{
-    field::goldilocks_field::GoldilocksField, plonk::config::PoseidonGoldilocksConfig,
-    util::timing::TimingTree,
-};
-use proof_gen::{proof_types::GeneratedSegmentProof, prover_state::ProverState, VerifierState};
+use evm_arithmetization::{ProofWithPublicInputs, ProofWithPublicValues, VerifierData};
+use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
+use plonky2::util::timing::TimingTree;
 use tracing::info;
 
 use self::circuit::{CircuitConfig, NUM_TABLES};
@@ -35,17 +38,41 @@ pub mod circuit;
 pub mod cli;
 pub mod persistence;
 
-// TODO(Robin): https://github.com/0xPolygonZero/zk_evm/issues/531
-pub(crate) type Config = PoseidonGoldilocksConfig;
-pub(crate) type Field = GoldilocksField;
-pub(crate) const SIZE: usize = 2;
+/// zkEVM proving state, needed to generate succinct block proofs for EVM-based
+/// chains.
+pub struct ProverState {
+    /// The set of pre-processed circuits to recursively prove blocks.
+    pub state: AllRecursiveCircuits,
+}
 
-pub(crate) type RecursiveCircuitsForTableSize =
-    evm_arithmetization::fixed_recursive_verifier::RecursiveCircuitsForTableSize<
-        Field,
-        Config,
-        SIZE,
-    >;
+/// zkEVM verifier state, useful for verifying generated block proofs.
+///
+/// This requires much less memory than its prover counterpart.
+pub struct VerifierState {
+    /// The verification circuit data associated to the block proof layer of the
+    /// zkEVM prover state.
+    pub state: VerifierData,
+}
+
+/// Extracts the verifier state from the entire prover state.
+impl<T: Borrow<ProverState>> From<T> for VerifierState {
+    fn from(prover_state: T) -> Self {
+        VerifierState {
+            state: prover_state.borrow().state.final_verifier_data(),
+        }
+    }
+}
+
+impl VerifierState {
+    /// Verifies a `block_proof`.
+    pub fn verify(&self, block_proof: &ProofWithPublicInputs) -> anyhow::Result<()> {
+        // Proof verification
+        self.state.verify(block_proof.clone())?;
+
+        // Verifier data verification
+        check_cyclic_proof_verifier_data(block_proof, &self.state.verifier_only, &self.state.common)
+    }
+}
 
 /// The global prover state.
 ///
@@ -149,46 +176,31 @@ impl ProverStateManager {
     fn load_table_circuits(
         &self,
         config: &StarkConfig,
-        all_proof: &AllProof<Field, Config, SIZE>,
-    ) -> anyhow::Result<[(RecursiveCircuitsForTableSize, u8); NUM_TABLES]> {
+        all_proof: &AllProof,
+    ) -> anyhow::Result<[Option<(RecursiveCircuitsForTableSize, u8)>; NUM_TABLES]> {
         let degrees = all_proof.degree_bits(config);
 
-        /// Given a recursive circuit index (e.g., Arithmetic / 0), return a
-        /// tuple containing the loaded table at the specified size and
-        /// its offset relative to the configured range used to pre-process the
-        /// circuits.
-        macro_rules! circuit {
-            ($circuit_index:expr) => {
-                (
-                    RecursiveCircuitResource::get(&(
-                        $circuit_index.into(),
-                        degrees[$circuit_index],
+        // Given a recursive circuit index (e.g., Arithmetic / 0), return a
+        // tuple containing the loaded table at the specified size and
+        // its offset relative to the configured range used to pre-process the
+        // circuits.
+        let circuits = core::array::from_fn(|i| match degrees[i] {
+            Some(size) => RecursiveCircuitResource::get(&(i.into(), size))
+                .map(|circuit_resource| {
+                    Some((
+                        circuit_resource,
+                        (size - self.circuit_config[i].start) as u8,
                     ))
-                    .map_err(|e| {
-                        let circuit: $crate::prover_state::circuit::Circuit = $circuit_index.into();
-                        let size = degrees[$circuit_index];
-                        anyhow::Error::from(e).context(format!(
-                            "Attempting to load circuit: {circuit:?} at size: {size}"
-                        ))
-                    })?,
-                    (degrees[$circuit_index] - self.circuit_config[$circuit_index].start) as u8,
-                )
-            };
-        }
+                })
+                .map_err(|e| {
+                    anyhow::Error::from(e)
+                        .context(format!("Attempting to load circuit: {i} at size: {size}"))
+                })
+                .unwrap_or(None),
+            None => None,
+        });
 
-        Ok([
-            circuit!(0),
-            circuit!(1),
-            circuit!(2),
-            circuit!(3),
-            circuit!(4),
-            circuit!(5),
-            circuit!(6),
-            circuit!(7),
-            circuit!(8),
-            #[cfg(feature = "cdk_erigon")]
-            circuit!(9),
-        ])
+        Ok(circuits)
     }
 
     /// Generate a segment proof using the specified input, loading
@@ -196,54 +208,58 @@ impl ProverStateManager {
     /// and finally aggregating them to a final transaction proof.
     fn segment_proof_on_demand(
         &self,
-        input: TrimmedGenerationInputs<Field>,
+        input: TrimmedGenerationInputs,
         segment_data: &mut GenerationSegmentData,
-    ) -> anyhow::Result<GeneratedSegmentProof> {
-        let config = StarkConfig::standard_fast_config();
+        config: &StarkConfig,
+        abort_signal: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<ProofWithPublicValues> {
         let all_stark = AllStark::default();
 
         let all_proof = prove(
             &all_stark,
-            &config,
+            config,
             input,
             segment_data,
             &mut TimingTree::default(),
-            None,
+            abort_signal.clone(),
         )?;
 
-        let table_circuits = self.load_table_circuits(&config, &all_proof)?;
+        let table_circuits = self.load_table_circuits(config, &all_proof)?;
 
-        let (intern, p_vals) =
-            p_state()
-                .state
-                .prove_segment_after_initial_stark(all_proof, &table_circuits, None)?;
+        let proof_with_pvs = p_state().state.prove_segment_after_initial_stark(
+            all_proof,
+            &table_circuits,
+            abort_signal,
+        )?;
 
-        Ok(GeneratedSegmentProof { p_vals, intern })
+        Ok(proof_with_pvs)
     }
 
     /// Generate a segment proof using the specified input on the monolithic
     /// circuit.
     fn segment_proof_monolithic(
         &self,
-        input: TrimmedGenerationInputs<Field>,
+        input: TrimmedGenerationInputs,
         segment_data: &mut GenerationSegmentData,
-    ) -> anyhow::Result<GeneratedSegmentProof> {
+        config: &StarkConfig,
+        abort_signal: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<ProofWithPublicValues> {
         let p_out = p_state().state.prove_segment(
             &AllStark::default(),
-            &StarkConfig::standard_fast_config(),
+            config,
             input,
             segment_data,
             &mut TimingTree::default(),
-            None,
+            abort_signal,
         )?;
 
         let ProverOutputData {
+            is_agg: _,
             is_dummy: _,
-            proof_with_pis: intern,
-            public_values: p_vals,
+            proof_with_pvs,
         } = p_out;
 
-        Ok(GeneratedSegmentProof { p_vals, intern })
+        Ok(proof_with_pvs)
     }
 
     /// Generate a segment proof using the specified input.
@@ -257,18 +273,34 @@ impl ProverStateManager {
     ///   needed.
     pub fn generate_segment_proof(
         &self,
-        input: (TrimmedGenerationInputs<Field>, GenerationSegmentData),
-    ) -> anyhow::Result<GeneratedSegmentProof> {
+        input: (TrimmedGenerationInputs, GenerationSegmentData),
+        abort_signal: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<ProofWithPublicValues> {
         let (generation_inputs, mut segment_data) = input;
+        let config = if self.circuit_config.use_test_config {
+            TEST_STARK_CONFIG
+        } else {
+            StarkConfig::standard_fast_config()
+        };
 
         match self.persistence {
             CircuitPersistence::None | CircuitPersistence::Disk(TableLoadStrategy::Monolithic) => {
                 info!("using monolithic circuit {:?}", self);
-                self.segment_proof_monolithic(generation_inputs, &mut segment_data)
+                self.segment_proof_monolithic(
+                    generation_inputs,
+                    &mut segment_data,
+                    &config,
+                    abort_signal,
+                )
             }
             CircuitPersistence::Disk(TableLoadStrategy::OnDemand) => {
                 info!("using on demand circuit {:?}", self);
-                self.segment_proof_on_demand(generation_inputs, &mut segment_data)
+                self.segment_proof_on_demand(
+                    generation_inputs,
+                    &mut segment_data,
+                    &config,
+                    abort_signal,
+                )
             }
         }
     }

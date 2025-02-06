@@ -13,16 +13,15 @@ use evm_arithmetization::proof::{BlockHashes, BlockMetadata, TrieRoots};
 use evm_arithmetization::prover::testing::prove_all_segments;
 use evm_arithmetization::testing_utils::{
     beacon_roots_account_nibbles, beacon_roots_contract_from_storage, init_logger,
-    preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
+    preinitialized_state_and_storage_tries, update_beacon_roots_account_storage, TEST_STARK_CONFIG,
 };
 use evm_arithmetization::verifier::testing::verify_all_proofs;
-use evm_arithmetization::{AllStark, Node, StarkConfig};
+use evm_arithmetization::{AllStark, Node, EMPTY_CONSOLIDATED_BLOCKHASH};
 use keccak_hash::keccak;
 use mpt_trie::nibbles::Nibbles;
 use mpt_trie::partial_trie::{HashedPartialTrie, PartialTrie};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::hash::hash_types::NUM_HASH_OUT_ELTS;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use plonky2::util::timing::TimingTree;
 use rand::random;
@@ -40,7 +39,7 @@ fn test_withdrawals() -> anyhow::Result<()> {
     init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
-    let config = StarkConfig::standard_fast_config();
+    let config = TEST_STARK_CONFIG;
 
     let block_metadata = BlockMetadata {
         block_timestamp: 1.into(),
@@ -103,7 +102,7 @@ fn test_withdrawals() -> anyhow::Result<()> {
         trie_roots_after,
         contract_code,
         checkpoint_state_trie_root: HashedPartialTrie::from(Node::Empty).hash(),
-        checkpoint_consolidated_hash: [F::ZERO; NUM_HASH_OUT_ELTS],
+        checkpoint_consolidated_hash: EMPTY_CONSOLIDATED_BLOCKHASH.map(F::from_canonical_u64),
         block_metadata,
         txn_number_before: 0.into(),
         gas_used_before: 0.into(),

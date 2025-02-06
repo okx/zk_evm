@@ -1,0 +1,26 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+num_cpus = "1.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sysinfo = "0.32.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "xtask"
+path = "xtask.rs"

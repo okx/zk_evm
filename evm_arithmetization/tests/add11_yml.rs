@@ -14,18 +14,16 @@ use evm_arithmetization::proof::{BlockHashes, BlockMetadata, TrieRoots};
 use evm_arithmetization::prover::testing::prove_all_segments;
 use evm_arithmetization::testing_utils::{
     beacon_roots_account_nibbles, beacon_roots_contract_from_storage, init_logger,
-    preinitialized_state_and_storage_tries, update_beacon_roots_account_storage,
+    preinitialized_state_and_storage_tries, update_beacon_roots_account_storage, TEST_STARK_CONFIG,
 };
 use evm_arithmetization::verifier::testing::verify_all_proofs;
-use evm_arithmetization::StarkConfig;
-use evm_arithmetization::{AllStark, GenerationInputs, Node};
+use evm_arithmetization::{AllStark, GenerationInputs, Node, EMPTY_CONSOLIDATED_BLOCKHASH};
 use hex_literal::hex;
 use keccak_hash::keccak;
 use mpt_trie::nibbles::Nibbles;
 use mpt_trie::partial_trie::{HashedPartialTrie, PartialTrie};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::hash::hash_types::NUM_HASH_OUT_ELTS;
 use plonky2::plonk::config::KeccakGoldilocksConfig;
 use plonky2::util::timing::TimingTree;
 
@@ -33,7 +31,7 @@ type F = GoldilocksField;
 const D: usize = 2;
 type C = KeccakGoldilocksConfig;
 
-fn get_generation_inputs() -> GenerationInputs<F> {
+fn get_generation_inputs() -> GenerationInputs {
     let beneficiary = hex!("2adc25665018aa1fe0e6bc666dac8fc2697ff9ba");
     let sender = hex!("a94f5374fce5edbc8e2a8697c15331677e6ebf0b");
     let to = hex!("095e7baea6a6c7c4c2dfeb977efac326af552d87");
@@ -185,7 +183,7 @@ fn get_generation_inputs() -> GenerationInputs<F> {
         receipts_root: receipts_trie.hash(),
     };
 
-    GenerationInputs::<F> {
+    GenerationInputs {
         signed_txns: vec![txn.to_vec()],
         burn_addr: None,
         withdrawals: vec![],
@@ -195,7 +193,7 @@ fn get_generation_inputs() -> GenerationInputs<F> {
         contract_code,
         block_metadata,
         checkpoint_state_trie_root: state_trie_before.hash(),
-        checkpoint_consolidated_hash: [F::ZERO; NUM_HASH_OUT_ELTS],
+        checkpoint_consolidated_hash: EMPTY_CONSOLIDATED_BLOCKHASH.map(F::from_canonical_u64),
         txn_number_before: 0.into(),
         gas_used_before: 0.into(),
         gas_used_after: 0xa868u64.into(),
@@ -214,7 +212,7 @@ fn test_add11_yml() -> anyhow::Result<()> {
     init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
-    let config = StarkConfig::standard_fast_config();
+    let config = TEST_STARK_CONFIG;
     let inputs = get_generation_inputs();
 
     let max_cpu_len_log = 20;

@@ -2,30 +2,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use ethereum_types::U256;
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use plonky2::field::extension::Extendable;
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::hash::hash_types::RichField;
-use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::iop::challenger::Challenger;
-use plonky2::plonk::config::{GenericConfig, GenericHashOut};
+use plonky2::plonk::config::GenericConfig;
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 use starky::config::StarkConfig;
 use starky::cross_table_lookup::{get_ctl_data, CtlData};
 use starky::lookup::GrandProductChallengeSet;
-use starky::proof::{MultiProof, StarkProofWithMetadata};
+use starky::proof::StarkProofWithMetadata;
 use starky::prover::prove_with_commitment;
 use starky::stark::Stark;
 
-use crate::all_stark::{AllStark, Table, NUM_TABLES};
+use crate::all_stark::{AllStark, Table, NUM_TABLES, OPTIONAL_TABLE_INDICES};
 use crate::cpu::kernel::aggregator::KERNEL;
-use crate::generation::segments::GenerationSegmentData;
 use crate::generation::{generate_traces, GenerationInputs, TrimmedGenerationInputs};
 use crate::get_challenges::observe_public_values;
-use crate::proof::{AllProof, MemCap, PublicValues, DEFAULT_CAP_LEN};
+use crate::proof::{AllProof, MemCap, MultiProof, PublicValues, DEFAULT_CAP_LEN};
+use crate::GenerationSegmentData;
 
 /// Generate traces, then create all STARK proofs.
 pub fn prove<F, C, const D: usize>(
@@ -47,7 +47,7 @@ where
 
     timed!(timing, "build kernel", Lazy::force(&KERNEL));
 
-    let (traces, mut public_values) = timed!(
+    let mut tables_with_pvs = timed!(
         timing,
         "generate all traces",
         generate_traces(all_stark, &inputs, config, segment_data, timing)?
@@ -58,8 +58,9 @@ where
     let proof = prove_with_traces(
         all_stark,
         config,
-        traces,
-        &mut public_values,
+        tables_with_pvs.tables,
+        tables_with_pvs.table_in_use,
+        &mut tables_with_pvs.public_values,
         timing,
         abort_signal,
     )?;
@@ -72,6 +73,7 @@ pub(crate) fn prove_with_traces<F, C, const D: usize>(
     all_stark: &AllStark<F, D>,
     config: &StarkConfig,
     trace_poly_values: [Vec<PolynomialValues<F>>; NUM_TABLES],
+    table_in_use: [bool; NUM_TABLES],
     public_values: &mut PublicValues<F>,
     timing: &mut TimingTree,
     abort_signal: Option<Arc<AtomicBool>>,
@@ -114,8 +116,14 @@ where
         .map(|c| c.merkle_tree.cap.clone())
         .collect::<Vec<_>>();
     let mut challenger = Challenger::<F, C::Hasher>::new();
-    for cap in &trace_caps {
-        challenger.observe_cap(cap);
+    for (i, cap) in trace_caps.iter().enumerate() {
+        if OPTIONAL_TABLE_INDICES.contains(&i) && !table_in_use[i] {
+            // Observe zero merkle caps when skipping Keccak tables.
+            let zero_merkle_cap = cap.flatten().iter().map(|_| F::ZERO).collect::<Vec<F>>();
+            challenger.observe_elements(&zero_merkle_cap);
+        } else {
+            challenger.observe_cap(cap);
+        }
     }
 
     observe_public_values::<F, C, D>(&mut challenger, public_values)
@@ -143,6 +151,7 @@ where
             config,
             &trace_poly_values,
             trace_commitments,
+            table_in_use,
             ctl_data_per_table,
             &mut challenger,
             &ctl_challenges,
@@ -150,34 +159,8 @@ where
             abort_signal,
         )?
     );
-    public_values.mem_before = MemCap {
-        mem_cap: mem_before_cap
-            .0
-            .iter()
-            .map(|h| {
-                h.to_vec()
-                    .iter()
-                    .map(|hi| hi.to_canonical_u64().into())
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>(),
-    };
-    public_values.mem_after = MemCap {
-        mem_cap: mem_after_cap
-            .0
-            .iter()
-            .map(|h| {
-                h.to_vec()
-                    .iter()
-                    .map(|hi| hi.to_canonical_u64().into())
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>(),
-    };
+    public_values.mem_before = mem_before_cap;
+    public_values.mem_after = mem_after_cap;
 
     // This is an expensive check, hence is only run when `debug_assertions` are
     // enabled.
@@ -206,13 +189,14 @@ where
             ctl_challenges,
         },
         public_values: public_values.clone(),
+        table_in_use,
     })
 }
 
-type ProofWithMemCaps<F, C, H, const D: usize> = (
-    [StarkProofWithMetadata<F, C, D>; NUM_TABLES],
-    MerkleCap<F, H>,
-    MerkleCap<F, H>,
+type ProofWithMemCaps<F, C, const D: usize> = (
+    [Option<StarkProofWithMetadata<F, C, D>>; NUM_TABLES],
+    MemCap,
+    MemCap,
 );
 
 /// Generates a proof for each STARK.
@@ -229,48 +213,65 @@ fn prove_with_commitments<F, C, const D: usize>(
     config: &StarkConfig,
     trace_poly_values: &[Vec<PolynomialValues<F>>; NUM_TABLES],
     trace_commitments: Vec<PolynomialBatch<F, C, D>>,
+    table_in_use: [bool; NUM_TABLES],
     ctl_data_per_table: [CtlData<F>; NUM_TABLES],
     challenger: &mut Challenger<F, C::Hasher>,
     ctl_challenges: &GrandProductChallengeSet<F>,
     timing: &mut TimingTree,
     abort_signal: Option<Arc<AtomicBool>>,
-) -> Result<ProofWithMemCaps<F, C, C::Hasher, D>>
+) -> Result<ProofWithMemCaps<F, C, D>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
 {
     macro_rules! prove_table {
         ($stark:ident, $table:expr) => {
-            timed!(
-                timing,
-                &format!("prove {} STARK", stringify!($stark)),
-                prove_single_table(
-                    &all_stark.$stark,
-                    config,
-                    &trace_poly_values[*$table],
-                    &trace_commitments[*$table],
-                    &ctl_data_per_table[*$table],
-                    ctl_challenges,
-                    challenger,
+            if table_in_use[*$table] {
+                Some(timed!(
                     timing,
-                    abort_signal.clone(),
-                )?
-            )
+                    &format!("prove {} STARK", stringify!($stark)),
+                    prove_single_table(
+                        &all_stark.$stark,
+                        config,
+                        &trace_poly_values[*$table],
+                        &trace_commitments[*$table],
+                        &ctl_data_per_table[*$table],
+                        ctl_challenges,
+                        challenger,
+                        timing,
+                        abort_signal.clone(),
+                    )?
+                ))
+            } else {
+                None
+            }
         };
     }
 
-    let (arithmetic_proof, _) = prove_table!(arithmetic_stark, Table::Arithmetic);
-    let (byte_packing_proof, _) = prove_table!(byte_packing_stark, Table::BytePacking);
-    let (cpu_proof, _) = prove_table!(cpu_stark, Table::Cpu);
-    let (keccak_proof, _) = prove_table!(keccak_stark, Table::Keccak);
-    let (keccak_sponge_proof, _) = prove_table!(keccak_sponge_stark, Table::KeccakSponge);
-    let (logic_proof, _) = prove_table!(logic_stark, Table::Logic);
-    let (memory_proof, _) = prove_table!(memory_stark, Table::Memory);
-    let (mem_before_proof, mem_before_cap) = prove_table!(mem_before_stark, Table::MemBefore);
-    let (mem_after_proof, mem_after_cap) = prove_table!(mem_after_stark, Table::MemAfter);
+    let arithmetic_proof = prove_table!(arithmetic_stark, Table::Arithmetic);
+    let byte_packing_proof = prove_table!(byte_packing_stark, Table::BytePacking);
+    let cpu_proof = prove_table!(cpu_stark, Table::Cpu);
+    let keccak_proof = prove_table!(keccak_stark, Table::Keccak);
+    let keccak_sponge_proof = prove_table!(keccak_sponge_stark, Table::KeccakSponge);
+    let logic_proof = prove_table!(logic_stark, Table::Logic);
+    let memory_proof = prove_table!(memory_stark, Table::Memory);
+    let mem_before_proof = prove_table!(mem_before_stark, Table::MemBefore);
+    let mem_after_proof = prove_table!(mem_after_stark, Table::MemAfter);
+
+    let mem_before_cap = trace_commitments[*Table::MemBefore].merkle_tree.cap.clone();
+    let mem_before_cap = MemCap::from_merkle_cap(mem_before_cap);
+    let mem_after_cap = trace_commitments[*Table::MemAfter].merkle_tree.cap.clone();
+    let mut mem_after_cap = MemCap::from_merkle_cap(mem_after_cap);
+    if !table_in_use[*Table::MemAfter] {
+        for hash in &mut mem_after_cap.mem_cap {
+            for element in hash.iter_mut() {
+                *element = U256::zero();
+            }
+        }
+    }
 
     #[cfg(feature = "cdk_erigon")]
-    let (poseidon_proof, _) = prove_table!(poseidon_stark, Table::Poseidon);
+    let poseidon_proof = prove_table!(poseidon_stark, Table::Poseidon);
 
     Ok((
         [
@@ -291,9 +292,6 @@ where
     ))
 }
 
-type ProofSingleWithCap<F, C, H, const D: usize> =
-    (StarkProofWithMetadata<F, C, D>, MerkleCap<F, H>);
-
 /// Computes a proof for a single STARK table, including:
 /// - the initial state of the challenger,
 /// - all the requires Merkle caps,
@@ -310,7 +308,7 @@ pub(crate) fn prove_single_table<F, C, S, const D: usize>(
     challenger: &mut Challenger<F, C::Hasher>,
     timing: &mut TimingTree,
     abort_signal: Option<Arc<AtomicBool>>,
-) -> Result<ProofSingleWithCap<F, C, C::Hasher, D>>
+) -> Result<StarkProofWithMetadata<F, C, D>>
 where
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -330,6 +328,8 @@ where
         Some(ctl_challenges),
         challenger,
         &[],
+        None,
+        None,
         timing,
     )
     .map(|proof_with_pis| StarkProofWithMetadata {
@@ -337,7 +337,7 @@ where
         init_challenger_state,
     })?;
 
-    Ok((proof, trace_commitment.merkle_tree.cap.clone()))
+    Ok(proof)
 }
 
 /// Utility method that checks whether a kill signal has been emitted by one of
@@ -370,13 +370,10 @@ pub(crate) fn features_check<F: RichField>(inputs: &TrimmedGenerationInputs<F>) 
 /// A utility module designed to test witness generation externally.
 pub mod testing {
     use super::*;
+    use crate::generation::ErrorWithTries;
     use crate::{
         cpu::kernel::interpreter::Interpreter,
-        generation::{
-            output_debug_tries,
-            segments::{SegmentDataIterator, SegmentError},
-            state::State,
-        },
+        generation::segments::{SegmentDataIterator, SegmentError},
     };
 
     /// Simulates the zkEVM CPU execution.
@@ -388,13 +385,7 @@ pub mod testing {
         let initial_offset = KERNEL.global_labels["init"];
         let mut interpreter: Interpreter<F> =
             Interpreter::new_with_generation_inputs(initial_offset, initial_stack, &inputs, None);
-        let result = interpreter.run();
-
-        if result.is_err() {
-            output_debug_tries(interpreter.get_generation_state())?;
-        }
-
-        result?;
+        interpreter.run()?;
         Ok(())
     }
 
@@ -415,8 +406,7 @@ pub mod testing {
         let mut proofs = vec![];
 
         for segment_run in segment_data_iterator {
-            let (_, mut next_data) =
-                segment_run.map_err(|e: SegmentError| anyhow::format_err!(e))?;
+            let (_, mut next_data) = segment_run?;
             let proof = prove(
                 all_stark,
                 config,
@@ -434,16 +424,14 @@ pub mod testing {
     pub fn simulate_execution_all_segments<F>(
         inputs: GenerationInputs<F>,
         max_cpu_len_log: usize,
-    ) -> Result<()>
+    ) -> Result<(), ErrorWithTries<SegmentError>>
     where
         F: RichField,
     {
         features_check(&inputs.clone().trim());
 
         for segment in SegmentDataIterator::<F>::new(&inputs, Some(max_cpu_len_log)) {
-            if let Err(e) = segment {
-                return Err(anyhow::format_err!(e));
-            }
+            segment?;
         }
 
         Ok(())

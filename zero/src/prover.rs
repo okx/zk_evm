@@ -8,19 +8,44 @@ use std::sync::Arc;
 
 use alloy::primitives::U256;
 use anyhow::{Context, Result};
-use futures::{future::BoxFuture, FutureExt, TryFutureExt, TryStreamExt};
+use evm_arithmetization::Field;
+use evm_arithmetization::SegmentDataIterator;
+use futures::{
+    future::BoxFuture,
+    future::{self, try_join, try_join_all},
+    stream::FuturesUnordered,
+    FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
+};
+use hashbrown::HashMap;
 use num_traits::ToPrimitive as _;
+use paladin::directive::{Directive, IndexedStream};
 use paladin::runtime::Runtime;
-use proof_gen::proof_types::GeneratedBlockProof;
+use plonky2::gates::noop::NoopGate;
+use plonky2::plonk::circuit_builder::CircuitBuilder;
+use plonky2::plonk::circuit_data::CircuitConfig;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{oneshot, Semaphore};
-use trace_decoder::{BlockTrace, OtherBlockData};
-use tracing::{error, info};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use trace_decoder::observer::DummyObserver;
+use trace_decoder::{BlockTrace, OtherBlockData, WireDisposition};
+use tracing::{debug, error, info};
 
 use crate::fs::generate_block_proof_file_name;
 use crate::ops;
+use crate::proof_types::GeneratedBlockProof;
+
+/// `ProofRuntime` represents the runtime environments used for generating
+/// different types of proofs. It contains separate runtimes for handling:
+///
+/// - `light_proof`: Typically for smaller, less resource-intensive tasks, such
+///   as aggregation.
+/// - `heavy_proof`: For larger, more computationally expensive tasks, such as
+///   STARK proof generation.
+pub struct ProofRuntime {
+    pub light_proof: Runtime,
+    pub heavy_proof: Runtime,
+}
 
 // All proving tasks are executed concurrently, which can cause issues for large
 // block intervals, where distant future blocks may be proven first.
@@ -33,6 +58,18 @@ use crate::ops;
 // batches as soon as they are generated.
 static PARALLEL_BLOCK_PROVING_PERMIT_POOL: Semaphore = Semaphore::const_new(0);
 
+pub const WIRE_DISPOSITION: WireDisposition = {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "eth_mainnet")] {
+            WireDisposition::Type1
+        } else if #[cfg(feature = "cdk_erigon")] {
+            WireDisposition::Type2
+        } else {
+            compile_error!("must select a feature");
+        }
+    }
+};
+
 #[derive(Debug, Clone)]
 pub struct ProverConfig {
     pub batch_size: usize,
@@ -43,6 +80,7 @@ pub struct ProverConfig {
     pub keep_intermediate_proofs: bool,
     pub block_batch_size: usize,
     pub block_pool_size: usize,
+    pub save_tries_on_error: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,14 +96,11 @@ impl BlockProverInput {
 
     pub async fn prove(
         self,
-        runtime: Arc<Runtime>,
+        proof_runtime: Arc<ProofRuntime>,
         previous: Option<impl Future<Output = Result<GeneratedBlockProof>>>,
         prover_config: Arc<ProverConfig>,
     ) -> Result<GeneratedBlockProof> {
         use anyhow::Context as _;
-        use evm_arithmetization::SegmentDataIterator;
-        use futures::{stream::FuturesUnordered, FutureExt};
-        use paladin::directive::{Directive, IndexedStream};
 
         let ProverConfig {
             max_cpu_len_log,
@@ -76,8 +111,15 @@ impl BlockProverInput {
 
         let block_number = self.get_block_number();
 
-        let block_generation_inputs =
-            trace_decoder::entrypoint(self.block_trace, self.other_data, batch_size)?;
+        let block_generation_inputs = trace_decoder::entrypoint(
+            self.block_trace,
+            self.other_data,
+            batch_size,
+            &mut DummyObserver::new(),
+            WIRE_DISPOSITION,
+        )?;
+
+        let batch_count = block_generation_inputs.len();
 
         // Create segment proof.
         let seg_prove_ops = ops::SegmentProof {
@@ -94,33 +136,178 @@ impl BlockProverInput {
             save_inputs_on_error,
         };
 
-        // Segment the batches, prove segments and aggregate them to resulting batch
-        // proofs.
-        let batch_proof_futs: FuturesUnordered<_> = block_generation_inputs
-            .iter()
-            .enumerate()
-            .map(|(idx, txn_batch)| {
-                let segment_data_iterator = SegmentDataIterator::<proof_gen::types::Field>::new(
-                    txn_batch,
-                    Some(max_cpu_len_log),
-                );
-
-                Directive::map(IndexedStream::from(segment_data_iterator), &seg_prove_ops)
-                    .fold(&seg_agg_ops)
-                    .run(&runtime)
-                    .map(move |e| {
-                        e.map(|p| (idx, proof_gen::proof_types::BatchAggregatableProof::from(p)))
-                    })
+        // Generate channels to communicate segments of each batch to a batch proving
+        // task. We generate segments and send them to the proving task, where they
+        // are proven in parallel.
+        let (segment_senders, segment_receivers): (Vec<_>, Vec<_>) = (0..batch_count)
+            .map(|_idx| {
+                let (segment_tx, segment_rx) =
+                    mpsc::channel::<Option<evm_arithmetization::AllData>>(1);
+                (segment_tx, segment_rx)
             })
-            .collect();
+            .unzip();
+
+        // The size of this channel does not matter much, as it is only used to collect
+        // batch proofs.
+        let (batch_proof_tx, mut batch_proof_rx) =
+            mpsc::channel::<(usize, crate::proof_types::BatchAggregatableProof)>(32);
+
+        // Spin up a task for each batch to generate segments for that batch
+        // and send them to the proving task.
+        let segment_generation_task = tokio::spawn(async move {
+            let mut batch_segment_futures: FuturesUnordered<_> = FuturesUnordered::new();
+
+            for (batch_idx, (txn_batch, segment_tx)) in block_generation_inputs
+                .into_iter()
+                .zip(segment_senders)
+                .enumerate()
+            {
+                batch_segment_futures.push(async move {
+                    let segment_data_iterator =
+                        SegmentDataIterator::<Field>::new(&txn_batch, Some(max_cpu_len_log));
+                    for (segment_idx, segment_data) in segment_data_iterator.enumerate() {
+                        segment_tx
+                            .send(Some(segment_data))
+                            .await
+                            .context(format!("failed to send segment data for batch {batch_idx} segment {segment_idx}"))?;
+                    }
+                    // Mark the end of the batch segments by sending `None`
+                    segment_tx
+                        .send(None)
+                        .await
+                        .context(format!("failed to send end segment data indicator for batch {batch_idx}"))?;
+                    anyhow::Ok(())
+                });
+            }
+            while let Some(it) = batch_segment_futures.next().await {
+                // In case of an error, propagate the error to the main task
+                it?;
+            }
+            let () = batch_segment_futures.try_collect().await?;
+            anyhow::Ok(())
+        });
+
+        let proof_runtime_ = proof_runtime.clone();
+        let batches_proving_task = tokio::spawn(async move {
+            let mut batch_proving_futures = FuturesUnordered::new();
+            // Span a proving subtask for each batch where we generate segment proofs
+            // and aggregate them to batch proof.
+            for (batch_idx, mut segment_rx) in segment_receivers.into_iter().enumerate() {
+                let batch_proof_tx = batch_proof_tx.clone();
+                let seg_prove_ops = seg_prove_ops.clone();
+                let seg_agg_ops = seg_agg_ops.clone();
+                let proof_runtime = proof_runtime_.clone();
+                // Tasks to dispatch proving jobs and aggregate segment proofs of one batch
+                batch_proving_futures.push(async move {
+                    let mut batch_segment_aggregatable_proofs = Vec::new();
+
+                    // This channel collects segment proofs from the one batch
+                    // proven in parallel. The size of this channel does not matter much,
+                    // as it is only used to collect segment aggregatable proofs.
+                    let (segment_proof_tx, mut segment_proof_rx) =
+                        mpsc::channel::<(usize, crate::proof_types::SegmentAggregatableProof)>(32);
+
+                    // Wait for segments and dispatch them to the segment proof worker task.
+                    // The segment proof worker task will prove the segment and send it back.
+                    let mut segment_counter = 0;
+                    let mut segment_proving_tasks = Vec::new();
+                    while let Some(Some(segment_data)) = segment_rx.recv().await {
+                        let seg_prove_ops = seg_prove_ops.clone();
+                        let proof_runtime = proof_runtime.clone();
+                        let segment_proof_tx = segment_proof_tx.clone();
+                        // Prove one segment in a dedicated async task.
+                        let segment_proving_task = tokio::spawn(async move {
+                            debug!(%batch_idx, %segment_counter, "proving batch segment");
+                            let seg_aggregatable_proof= Directive::map(
+                                IndexedStream::from([segment_data]),
+                                &seg_prove_ops,
+                            )
+                                .run(&proof_runtime.heavy_proof)
+                                .await?
+                                .into_values_sorted()
+                                .await?
+                                .into_iter()
+                                .next()
+                                .context(format!(
+                                    "failed to get segment proof, batch: {batch_idx}, segment: {segment_counter}"
+                                ))?;
+
+                            segment_proof_tx
+                                .send((segment_counter, seg_aggregatable_proof))
+                                .await
+                                .context(format!(
+                                    "unable to send segment proof, batch: {batch_idx}, segment: {segment_counter}"
+                                ))?;
+                            anyhow::Ok(())
+                        });
+
+                        segment_proving_tasks.push(segment_proving_task);
+                        segment_counter += 1;
+                    }
+                    drop(segment_proof_tx);
+                    // Wait for all the segment proving tasks of one batch to finish.
+                    while let Some((segment_idx, segment_aggregatable_proof)) = segment_proof_rx.recv().await {
+                        batch_segment_aggregatable_proofs.push((segment_idx, segment_aggregatable_proof));
+                    }
+                    try_join_all(segment_proving_tasks).await?;
+                    batch_segment_aggregatable_proofs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    debug!(%block_number, batch=%batch_idx, "finished proving all segments");
+                    // We have proved all the segments in a batch,
+                    // now we need to aggregate them to the batch proof.
+                    // Fold the segment aggregated proof stream into a single batch proof.
+                    let batch_proof = if batch_segment_aggregatable_proofs.len() == 1 {
+                        // If there is only one segment aggregated proof, just transform it to batch proof.
+                        (batch_idx, crate::proof_types::BatchAggregatableProof::from(
+                            batch_segment_aggregatable_proofs.pop().map(|(_, it)| it).unwrap(),
+                        ))
+                    } else {
+                        Directive::fold(IndexedStream::from(batch_segment_aggregatable_proofs.into_iter().map(|(_, it)| it)), &seg_agg_ops)
+                            .run(&proof_runtime.light_proof)
+                            .map(move |e| {
+                                e.map(|p| {
+                                    (
+                                        batch_idx,
+                                        crate::proof_types::BatchAggregatableProof::from(p),
+                                    )
+                                })
+                            })
+                            .await?
+                    };
+                    debug!(%block_number, batch=%batch_idx, "generated batch proof for block");
+                    batch_proof_tx.send(batch_proof).await.context(format!(
+                        "unable to send batch proof, block: {block_number}, batch: {batch_idx}"
+                    ))?;
+                    anyhow::Ok(())
+                });
+            }
+            // Wait for all the batch proving tasks to finish. Exit early on error.
+            while let Some(it) = batch_proving_futures.next().await {
+                it?;
+            }
+            anyhow::Ok(())
+        });
+
+        // Collect all the batch proofs.
+        let mut batch_proofs: Vec<(usize, crate::proof_types::BatchAggregatableProof)> = Vec::new();
+        while let Some((batch_idx, batch_proof)) = batch_proof_rx.recv().await {
+            batch_proofs.push((batch_idx, batch_proof));
+        }
+        debug!(%block_number, "collected all batch proofs");
+
+        // Wait for the segment generation and proving tasks to finish.
+        let _ = try_join(segment_generation_task, batches_proving_task).await?;
+
+        batch_proofs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         // Fold the batch aggregated proof stream into a single proof.
-        let final_batch_proof =
-            Directive::fold(IndexedStream::new(batch_proof_futs), &batch_agg_ops)
-                .run(&runtime)
-                .await?;
+        let final_batch_proof = Directive::fold(
+            IndexedStream::from(batch_proofs.into_iter().map(|(_, it)| it)),
+            &batch_agg_ops,
+        )
+        .run(&proof_runtime.light_proof)
+        .await?;
 
-        if let proof_gen::proof_types::BatchAggregatableProof::Agg(proof) = final_batch_proof {
+        if let crate::proof_types::BatchAggregatableProof::BatchAgg(proof) = final_batch_proof {
             let block_number = block_number
                 .to_u64()
                 .context("block number overflows u64")?;
@@ -134,7 +321,7 @@ impl BlockProverInput {
                     prev,
                     save_inputs_on_error,
                 })
-                .run(&runtime)
+                .run(&proof_runtime.light_proof)
                 .await?;
 
             info!("Successfully proved block {block_number}");
@@ -147,43 +334,53 @@ impl BlockProverInput {
 
     pub async fn prove_test(
         self,
-        runtime: Arc<Runtime>,
+        proof_runtime: Arc<ProofRuntime>,
         previous: Option<impl Future<Output = Result<GeneratedBlockProof>>>,
         prover_config: Arc<ProverConfig>,
     ) -> Result<GeneratedBlockProof> {
         use std::iter::repeat;
 
-        use futures::future;
         use paladin::directive::{Directive, IndexedStream};
 
         let ProverConfig {
             max_cpu_len_log,
             batch_size,
             save_inputs_on_error,
+            save_tries_on_error,
             ..
         } = *prover_config;
 
         let block_number = self.get_block_number();
         info!("Testing witness generation for block {block_number}.");
 
-        let block_generation_inputs =
-            trace_decoder::entrypoint(self.block_trace, self.other_data, batch_size)?;
+        let block_generation_inputs = trace_decoder::entrypoint(
+            self.block_trace,
+            self.other_data,
+            batch_size,
+            &mut DummyObserver::new(),
+            WIRE_DISPOSITION,
+        )?;
 
         let seg_ops = ops::SegmentProofTestOnly {
             save_inputs_on_error,
+            save_tries_on_error,
         };
 
         let simulation = Directive::map(
             IndexedStream::from(
                 block_generation_inputs
                     .into_iter()
-                    .zip(repeat(max_cpu_len_log)),
+                    .enumerate()
+                    .zip(repeat(max_cpu_len_log))
+                    .map(|((batch_index, txn_batch), max_cpu_len_log)| {
+                        (txn_batch, max_cpu_len_log, batch_index)
+                    }),
             ),
             &seg_ops,
         );
 
         simulation
-            .run(&runtime)
+            .run(&proof_runtime.light_proof)
             .await?
             .try_for_each(|_| future::ok(()))
             .await?;
@@ -196,29 +393,38 @@ impl BlockProverInput {
             None => None,
         };
 
+        // Build a dummy proof for output type consistency
+        let dummy_proof = {
+            let mut builder = CircuitBuilder::new(CircuitConfig::default());
+            builder.add_gate(NoopGate, vec![]);
+            let circuit_data = builder.build::<_>();
+
+            plonky2::recursion::dummy_circuit::dummy_proof(&circuit_data, HashMap::default())?
+        };
+
         // Dummy proof to match expected output type.
         Ok(GeneratedBlockProof {
             b_height: block_number
                 .to_u64()
                 .expect("Block number should fit in a u64"),
-            intern: proof_gen::proof_gen::dummy_proof()?,
+            intern: dummy_proof,
         })
     }
 }
 
 async fn prove_block(
     block: BlockProverInput,
-    runtime: Arc<Runtime>,
+    proof_runtime: Arc<ProofRuntime>,
     previous_block_proof: Option<BoxFuture<'_, Result<GeneratedBlockProof>>>,
     prover_config: Arc<ProverConfig>,
 ) -> Result<GeneratedBlockProof> {
     if prover_config.test_only {
         block
-            .prove_test(runtime, previous_block_proof, prover_config)
+            .prove_test(proof_runtime, previous_block_proof, prover_config)
             .await
     } else {
         block
-            .prove(runtime, previous_block_proof, prover_config)
+            .prove(proof_runtime, previous_block_proof, prover_config)
             .await
     }
 }
@@ -229,7 +435,7 @@ async fn prove_block(
 /// block proofs as well.
 pub async fn prove(
     mut block_receiver: Receiver<(BlockProverInput, bool)>,
-    runtime: Arc<Runtime>,
+    proof_runtime: Arc<ProofRuntime>,
     checkpoint_proof: Option<GeneratedBlockProof>,
     prover_config: Arc<ProverConfig>,
 ) -> Result<()> {
@@ -249,7 +455,7 @@ pub async fn prove(
         let (tx, rx) = oneshot::channel::<GeneratedBlockProof>();
         let prover_config = prover_config.clone();
         let previous_block_proof = prev_proof.take();
-        let runtime = runtime.clone();
+        let proof_runtime = proof_runtime.clone();
         let block_number = block_prover_input.get_block_number();
 
         let prove_permit = PARALLEL_BLOCK_PROVING_PERMIT_POOL.acquire().await?;
@@ -260,7 +466,7 @@ pub async fn prove(
             // Prove the block
             let block_proof = prove_block(
                 block_prover_input,
-                runtime,
+                proof_runtime,
                 previous_block_proof,
                 prover_config.clone(),
             )

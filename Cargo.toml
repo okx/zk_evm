@@ -1,11 +1,10 @@
 [workspace]
 members = [
   "common",
-  "compat",
   "evm_arithmetization",
   "mpt_trie",
   "proc_macro",
-  "proof_gen",
+  "scripts",
   "smt_trie",
   "trace_decoder",
   "zero",
@@ -21,7 +20,6 @@ keywords = ["cryptography", "STARK", "plonky2", "ethereum", "zk"]
 categories = ["cryptography::cryptocurrencies"]
 
 [workspace.dependencies]
-__compat_primitive_types = { version = "0.12.2", package = "primitive-types" }
 alloy = { version = '0.3.0', default-features = false, features = [
   "consensus",
   "reqwest",
@@ -42,11 +40,11 @@ axum = "0.7.5"
 bitflags = "2.5.0"
 bitvec = "1.0.1"
 bytes = "1.6.0"
-cargo_metadata = "0.18.1"
 ciborium = "0.2.2"
 ciborium-io = "0.2.2"
 clap = { version = "4.5.7", features = ["derive", "env"] }
-compat = { path = "compat" }
+alloy-compat = "0.1.0"
+copyvec = "0.2.0"
 criterion = "0.5.1"
 dotenvy = "0.15.7"
 either = "1.12.0"
@@ -71,12 +69,14 @@ num-bigint = "0.4.5"
 num-traits = "0.2.19"
 nunny = "0.2.1"
 once_cell = "1.19.0"
-paladin-core = "0.4.2"
+# TODO: update when paladin is released to 0.4.4 with abort signal support
+paladin-core = { git = "https://github.com/0xPolygonZero/paladin.git", rev = "f58cbc14a751f1000603cfd9fdd4f350986ec2e7" }
 parking_lot = "0.12.3"
-paste = "1.0.15"
 pest = "2.7.10"
 pest_derive = "2.7.10"
 pretty_env_logger = "0.5.0"
+proc-macro2 = "1.0"
+quote = "1.0"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 ripemd = "0.1.3"
@@ -84,45 +84,39 @@ rlp = "0.5.2"
 rlp-derive = "0.1.0"
 ruint = "1.12.3"
 serde = "1.0.203"
-serde-big-array = "0.5.1"
 serde_json = "1.0.118"
 serde_path_to_error = "0.1.16"
+serde-big-array = "0.5.1"
 sha2 = "0.10.8"
 static_assertions = "1.1.0"
+syn = "2.0"
 thiserror = "1.0.61"
 tiny-keccak = "2.0.2"
 tokio = { version = "1.38.0", features = ["full"] }
-toml = "0.8.14"
 tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1.0"
 u4 = "0.1.0"
 uint = "0.9.5"
 url = "2.5.2"
 winnow = "0.6.13"
 
 # local dependencies
-evm_arithmetization = { path = "evm_arithmetization", version = "0.4.0", default-features = false }
-mpt_trie = { path = "mpt_trie", version = "0.4.1" }
-proof_gen = { path = "proof_gen", version = "0.4.0", default-features = false }
-smt_trie = { path = "smt_trie", version = "0.1.1" }
-trace_decoder = { path = "trace_decoder", version = "0.6.0", default-features = false }
+evm_arithmetization = { path = "evm_arithmetization", version = "0.5.1", default-features = false }
+mpt_trie = { path = "mpt_trie", version = "0.5.0" }
+smt_trie = { path = "smt_trie", version = "0.2.0" }
+trace_decoder = { path = "trace_decoder", version = "0.7.0", default-features = false }
 zk_evm_common = { path = "common", version = "0.1.0" }
 zk_evm_proc_macro = { path = "proc_macro", version = "0.1.0" }
 zero = { path = "zero", default-features = false }
 
 # plonky2-related dependencies
-plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
-plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
-plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
-starky = { git = "https://github.com/okx/plonky2.git", rev = "cc96911fc5f250a0ef39abbf5165ea99abed8f69" }
+plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
+plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
+plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
+starky = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
 zeknox = { git = "https://github.com/okx/zeknox.git", rev = "500ce15c50d31bd48b466e4571cad2c66bacf368" }
-
-# proc macro related dependencies
-proc-macro2 = "1.0"
-quote = "1.0"
-syn = "2.0"
-trybuild = "1.0"
 
 [workspace.lints.clippy]
 too_long_first_doc_paragraph = "allow"

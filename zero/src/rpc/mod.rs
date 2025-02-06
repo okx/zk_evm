@@ -2,19 +2,20 @@ zk_evm_common::check_chain_features!();
 
 use std::sync::Arc;
 
-use __compat_primitive_types::{H256, U256};
 use alloy::{
-    primitives::{Address, Bytes, FixedBytes, B256},
+    primitives::{Address, Bloom, Bytes, FixedBytes, B256, U256},
     providers::Provider,
     rpc::types::eth::{BlockId, BlockTransactionsKind, Withdrawal},
     transports::Transport,
 };
+use alloy_compat::Compat as _;
 use anyhow::{anyhow, Context as _};
 use clap::ValueEnum;
-use compat::Compat;
-use evm_arithmetization::proof::{consolidate_hashes, BlockHashes, BlockMetadata};
+use evm_arithmetization::{
+    proof::{consolidate_hashes, BlockHashes, BlockMetadata},
+    Field, Hasher,
+};
 use futures::{StreamExt as _, TryStreamExt as _};
-use proof_gen::types::{Field, Hasher};
 use serde_json::json;
 use trace_decoder::{BlockLevelData, OtherBlockData};
 use tracing::warn;
@@ -43,13 +44,12 @@ pub async fn block_prover_input<ProviderT, TransportT>(
     cached_provider: Arc<CachedProvider<ProviderT, TransportT>>,
     block_id: BlockId,
     checkpoint_block_number: u64,
-    rpc_type: RpcType,
 ) -> Result<BlockProverInput, anyhow::Error>
 where
     ProviderT: Provider<TransportT>,
     TransportT: Transport + Clone,
 {
-    match rpc_type {
+    match cached_provider.rpc_type {
         RpcType::Jerigon => {
             jerigon::block_prover_input(cached_provider, block_id, checkpoint_block_number).await
         }
@@ -103,8 +103,8 @@ where
                 async move {
                     let block = cached_provider
                         .get_block((block_num as u64).into(), BlockTransactionsKind::Hashes)
-                        .await
-                        .context("couldn't get block")?;
+                        .await?
+                        .ok_or(anyhow!("block not found {block_num}"))?;
                     anyhow::Ok([
                         (block.header.hash, Some(block_num)),
                         (block.header.parent_hash, previous_block_number),
@@ -210,8 +210,8 @@ where
 {
     let target_block = cached_provider
         .get_block(target_block_id, BlockTransactionsKind::Hashes)
-        .await?;
-    let target_block_number = target_block.header.number;
+        .await?
+        .ok_or(anyhow!("target block not found {}", target_block_id))?;
     let chain_id = cached_provider.get_provider().await?.get_chain_id().await?;
 
     // Grab interval checkpoint block state trie
@@ -221,11 +221,15 @@ where
             BlockTransactionsKind::Hashes,
         )
         .await?
+        .ok_or(anyhow!(
+            "checkpoint block not found {}",
+            checkpoint_block_number
+        ))?
         .header
         .state_root;
 
     let prev_hashes =
-        fetch_previous_block_hashes(cached_provider.clone(), target_block_number).await?;
+        fetch_previous_block_hashes(cached_provider.clone(), target_block.header.number).await?;
     let checkpoint_prev_hashes =
         fetch_previous_block_hashes(cached_provider, checkpoint_block_number + 1) // include the checkpoint block
             .await?
@@ -236,7 +240,7 @@ where
             b_meta: BlockMetadata {
                 block_beneficiary: target_block.header.miner.compat(),
                 block_timestamp: target_block.header.timestamp.into(),
-                block_number: target_block_number.into(),
+                block_number: target_block.header.number.into(),
                 block_difficulty: target_block.header.difficulty.into(),
                 block_random: target_block
                     .header
@@ -259,7 +263,17 @@ where
                         .into()
                 },
                 block_gas_used: target_block.header.gas_used.into(),
-                block_bloom: target_block.header.logs_bloom.compat(),
+                block_bloom: {
+                    const CHUNK: usize = 32;
+                    let Bloom(FixedBytes(bytes)) = target_block.header.logs_bloom;
+                    let chunks = bytes.chunks_exact(CHUNK);
+                    assert!(chunks.remainder().is_empty());
+                    let mut array = [U256::ZERO; 8];
+                    for (ix, chunk) in chunks.enumerate() {
+                        array[ix] = U256::from_le_bytes::<CHUNK>(chunk.try_into().unwrap());
+                    }
+                    array.map(alloy_compat::Compat::compat)
+                },
                 parent_beacon_block_root: if cfg!(feature = "eth_mainnet") {
                     target_block
                         .header
@@ -267,7 +281,7 @@ where
                         .context("target block is missing field `parent_beacon_block_root`")?
                         .compat()
                 } else {
-                    H256::zero()
+                    Default::default()
                 },
                 block_blob_gas_used: if cfg!(feature = "eth_mainnet") {
                     target_block
@@ -276,7 +290,7 @@ where
                         .context("target block is missing field `blob_gas_used`")?
                         .into()
                 } else {
-                    U256::zero()
+                    Default::default()
                 },
                 block_excess_blob_gas: if cfg!(feature = "eth_mainnet") {
                     target_block
@@ -285,7 +299,7 @@ where
                         .context("target block is missing field `excess_blob_gas`")?
                         .into()
                 } else {
-                    U256::zero()
+                    Default::default()
                 },
             },
             b_hashes: BlockHashes {
@@ -309,6 +323,13 @@ where
             // TODO: https://github.com/0xPolygonZero/zk_evm/issues/565
             //       Retrieve the actual burn address from `cdk-erigon`.
             Some(Address::ZERO.compat())
+        } else {
+            None
+        },
+        ger_data: if cfg!(feature = "cdk_erigon") {
+            // TODO: https://github.com/0xPolygonZero/zk_evm/issues/565
+            //       Retrieve the actual GER data from `cdk-erigon`.
+            None
         } else {
             None
         },

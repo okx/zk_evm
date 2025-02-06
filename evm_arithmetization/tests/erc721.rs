@@ -14,17 +14,16 @@ use evm_arithmetization::prover::testing::prove_all_segments;
 use evm_arithmetization::testing_utils::{
     beacon_roots_account_nibbles, beacon_roots_contract_from_storage, create_account_storage,
     init_logger, preinitialized_state_and_storage_tries, sd2u, sh2u,
-    update_beacon_roots_account_storage,
+    update_beacon_roots_account_storage, TEST_STARK_CONFIG,
 };
 use evm_arithmetization::verifier::testing::verify_all_proofs;
-use evm_arithmetization::{AllStark, Node, StarkConfig};
+use evm_arithmetization::{AllStark, Node, EMPTY_CONSOLIDATED_BLOCKHASH};
 use hex_literal::hex;
 use keccak_hash::keccak;
 use mpt_trie::nibbles::Nibbles;
 use mpt_trie::partial_trie::{HashedPartialTrie, PartialTrie};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::Field;
-use plonky2::hash::hash_types::NUM_HASH_OUT_ELTS;
 use plonky2::plonk::config::KeccakGoldilocksConfig;
 use plonky2::util::timing::TimingTree;
 
@@ -56,6 +55,10 @@ type C = KeccakGoldilocksConfig;
 /// `1337` from address `0x5B38Da6a701c568545dCfcB03FcB875f56beddC4` to address
 /// `0xAb8483F64d9C6d1EcF9b849Ae677dD3315835cb2`.
 #[test]
+// This test is run in CI under the "Run Specific Ignored Tests in Release Mode" job.
+// It is marked as ignored to prevent it from running by default in debug mode due to its longer
+// execution time.
+#[ignore]
 fn test_erc721() -> anyhow::Result<()> {
     init_logger();
 
@@ -63,7 +66,7 @@ fn test_erc721() -> anyhow::Result<()> {
     init_cuda_rs();
 
     let all_stark = AllStark::<F, D>::default();
-    let config = StarkConfig::standard_fast_config();
+    let config = TEST_STARK_CONFIG;
 
     let beneficiary = hex!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
     let owner = hex!("5B38Da6a701c568545dCfcB03FcB875f56beddC4");
@@ -197,7 +200,7 @@ fn test_erc721() -> anyhow::Result<()> {
         trie_roots_after,
         contract_code,
         checkpoint_state_trie_root: HashedPartialTrie::from(Node::Empty).hash(),
-        checkpoint_consolidated_hash: [F::ZERO; NUM_HASH_OUT_ELTS],
+        checkpoint_consolidated_hash: EMPTY_CONSOLIDATED_BLOCKHASH.map(F::from_canonical_u64),
         block_metadata,
         txn_number_before: 0.into(),
         gas_used_before: 0.into(),

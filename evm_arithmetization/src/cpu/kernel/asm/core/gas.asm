@@ -16,17 +16,7 @@ global sys_gas:
 %endmacro
 
 
-// TODO: `%refund_gas` and `refund_gas_hook` are hooks used for debugging. They should be removed at some point and `refund_gas_original` renamed to `refund_gas`.
 %macro refund_gas
-    PUSH %%after %jump(refund_gas_hook)
-%%after:
-    %refund_gas_original
-%endmacro
-
-global refund_gas_hook:
-    JUMP
-
-%macro refund_gas_original
     // stack: amount
     DUP1 %journal_refund
     %mload_global_metadata(@GLOBAL_METADATA_REFUND_COUNTER)
@@ -34,18 +24,8 @@ global refund_gas_hook:
     %mstore_global_metadata(@GLOBAL_METADATA_REFUND_COUNTER)
 %endmacro
 
-// TODO: `%charge_gas` and `charge_gas_hook` are hooks used for debugging. They should be removed at some point and `charge_gas_original` renamed to `charge_gas`.
-%macro charge_gas
-    PUSH %%after %jump(charge_gas_hook)
-%%after:
-    %charge_gas_original
-%endmacro
-
-global charge_gas_hook:
-    JUMP
-
 // Charge gas. Faults if we exceed the limit for the current context.
-%macro charge_gas_original
+%macro charge_gas
     // stack: gas, kexit_info
     %shl_const(192)
     ADD
@@ -59,6 +39,31 @@ global charge_gas_hook:
     %jumpi(fault_exception)
     // stack: kexit_info'
 %endmacro
+
+// Charge gas. Faults if we exceed the limit for the current context,
+// and prune context in case of an exception.
+%macro charge_gas_and_prune
+    // stack: gas, kexit_info, new_ctx, retdest
+    %shl_const(192)
+    ADD
+    // stack: kexit_info', new_ctx
+    %ctx_gas_limit
+    // stack: gas_limit, kexit_info', new_ctx
+    DUP2 %shr_const(192)
+    // stack: gas_used, gas_limit, kexit_info', new_ctx
+    GT
+    // stack: out_of_gas, kexit_info', new_ctx
+    %jumpi(fault_exception_and_prune)
+    // stack: kexit_info', new_ctx
+    SWAP1 POP
+%endmacro
+
+// Prunes previously created context before faulting.
+global fault_exception_and_prune:
+    // stack: kexit_info', new_ctx
+    SWAP1 %prune_context
+    // stack: kexit_info'
+    %jump(fault_exception)
 
 // Charge a constant amount of gas.
 %macro charge_gas_const(gas)
@@ -108,13 +113,13 @@ global sys_gasprice:
 // Given the current kexit_info, drains all but one 64th of its remaining gas.
 // Returns how much gas was drained.
 %macro drain_all_but_one_64th_gas
-    // stack: kexit_info
+    // stack: kexit_info, new_ctx
     DUP1 %leftover_gas
-    // stack: leftover_gas, kexit_info
+    // stack: leftover_gas, kexit_info, new_ctx
     %all_but_one_64th
-    // stack: all_but_one_64th, kexit_info
-    %stack (all_but_one_64th, kexit_info) -> (all_but_one_64th, kexit_info, all_but_one_64th)
-    %charge_gas
+    // stack: all_but_one_64th, kexit_info, new_ctx
+    %stack (all_but_one_64th, kexit_info, new_ctx) -> (all_but_one_64th, kexit_info, new_ctx, all_but_one_64th)
+    %charge_gas_and_prune
     // stack: kexit_info, drained_gas
 %endmacro
 

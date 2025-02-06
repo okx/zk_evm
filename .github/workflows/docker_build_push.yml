@@ -1,3 +1,5 @@
+---   # Workflow for building and deploying docker images
+
 name: Docker Build & Push
 
 on:
@@ -13,6 +15,7 @@ jobs:
   docker:
     name: Build and push leader and worker docker images to GitHub Container Registry
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       packages: write
     steps:

@@ -1,3 +1,5 @@
+---   # Run and populate blockchain with transactions and generate proofs using native tracer
+
 name: Jerigon Integration
 
 on:
@@ -18,8 +20,7 @@ jobs:
   test_jerigon_native_tracer_proving:
     name: Native tracer proof generation
     runs-on: zero-ci
-    timeout-minutes: 40
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+    timeout-minutes: 30
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -31,8 +32,7 @@ jobs:
           ref: "feat/kurtosis-network"
           path: jerigon-test-network
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -53,36 +53,37 @@ jobs:
         run: |
           echo "deb [trusted=yes] https://apt.fury.io/kurtosis-tech/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
           sudo apt update
-          sudo apt install kurtosis-cli
+          sudo apt install kurtosis-cli=1.3.1
 
-      #It is much easier to use cast tool in scripts so install foundry
+      # It is much easier to use cast tool in scripts so install foundry
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Run cancun test network
         run: |
           docker pull ghcr.io/0xpolygonzero/erigon:feat-zero
-          kurtosis run --enclave cancun-testnet github.com/ethpandaops/ethereum-package@4.0.0 --args-file jerigon-test-network/network_params.yml
+          kurtosis run --enclave cancun-testnet github.com/ethpandaops/ethereum-package@4.4.0 \
+            --args-file jerigon-test-network/network_params.yml
 
       - name: Generate blocks with transactions
         run: |
-          ETH_RPC_URL="$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
+          ETH_RPC_URL="http://$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
           cast rpc eth_blockNumber --rpc-url $ETH_RPC_URL
           cd jerigon-test-network && set -a && source .env && set +a
           bash ./tests/generate_transactions.sh
 
       - name: Run prove blocks with native tracer in test_only mode
         run: |
-          ETH_RPC_URL="$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
+          ETH_RPC_URL="http://$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
           ulimit -n 8192
-          OUTPUT_TO_TERMINAL=true ./scripts/prove_rpc.sh 0x1 0xf $ETH_RPC_URL native true 3000 100 test_only
+          cargo xtask prove-rpc "$ETH_RPC_URL" native test 1 -e 15 -c 0 -b 3000 -r 100
           echo "Proving blocks in test_only mode finished"
 
       - name: Run prove blocks with native tracer in real mode
         run: |
-          ETH_RPC_URL="$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
+          ETH_RPC_URL="http://$(kurtosis port print cancun-testnet el-2-erigon-lighthouse ws-rpc)"
           rm -rf proofs/* circuits/* ./proofs.json test.out verify.out leader.out
-          OUTPUT_TO_TERMINAL=true RUN_VERIFICATION=true ./scripts/prove_rpc.sh 0x4 0x7 $ETH_RPC_URL native true 3000 100
+          cargo xtask prove-rpc "$ETH_RPC_URL" native verify 4 -e 7 -c 3 -b 3000 -r 100
           echo "Proving blocks in real mode finished"
 
       - name: Shut down network

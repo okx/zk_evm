@@ -1,3 +1,5 @@
+---  # Workflow with multiple jobs to test different parts of the project
+
 name: Continuous Integration
 
 on:
@@ -22,13 +24,11 @@ jobs:
     name: Test mpt_trie
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up rust cache
         uses: Swatinem/rust-cache@v2
@@ -38,7 +38,11 @@ jobs:
       - name: Test in mpt_trie subdirectory
         run: cargo test --manifest-path mpt_trie/Cargo.toml
         env:
-          RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
+          RUSTFLAGS: >
+            -Copt-level=3
+            -Cdebug-assertions
+            -Coverflow-checks=y
+            -Cdebuginfo=0
           RUST_LOG: 1
           CARGO_INCREMENTAL: 1
           RUST_BACKTRACE: 1
@@ -46,67 +50,37 @@ jobs:
   test_trace_decoder:
     name: Test trace_decoder
     runs-on: zero-ci
-    timeout-minutes: 30
+    timeout-minutes: 10
     env:
       RUST_LOG: info
       CARGO_INCREMENTAL: 1
       RUST_BACKTRACE: 1
-
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up rust cache
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
-      - name: build # build separately so test logs are actually nice
+      - name: build  # build separately so test logs are actually nice
         run: cargo build --tests --manifest-path trace_decoder/Cargo.toml
 
       - name: test
         run: cargo test --release --manifest-path trace_decoder/Cargo.toml -- --nocapture
 
-  test_proof_gen:
-    name: Test proof_gen
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Set up rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Test in proof_gen subdirectory
-        run: cargo test --manifest-path proof_gen/Cargo.toml
-        env:
-          RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
-          RUST_LOG: 1
-          CARGO_INCREMENTAL: 1
-          RUST_BACKTRACE: 1
-
   test_evm_arithmetization:
     name: Test evm_arithmetization
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
+    timeout-minutes: 20
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up rust cache
         uses: Swatinem/rust-cache@v2
@@ -121,17 +95,35 @@ jobs:
           CARGO_INCREMENTAL: 1
           RUST_BACKTRACE: 1
 
-  test_zero_bin:
-    name: Test zero_bin
+  run_ignored_tests:
+    name: Slow evm_arithmetization tests in release mode
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
+    timeout-minutes: 10
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Set up rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Run specific ignored tests in release mode
+        run: |
+          cargo test --release \
+          --test empty_tables --test erc721 --test two_to_one_block -- --ignored
+
+  test_zero_bin:
+    name: Test zero_bin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up rust cache
         uses: Swatinem/rust-cache@v2
@@ -141,7 +133,6 @@ jobs:
       - name: Test in zero_bin subdirectory
         run: |
           cargo test --manifest-path zero/Cargo.toml
-
         env:
           RUSTFLAGS: -Copt-level=3 -Cdebug-assertions -Coverflow-checks=y -Cdebuginfo=0
           RUST_LOG: 1
@@ -151,14 +142,12 @@ jobs:
   test_zk_evm_proc_macro:
     name: Test zk_evm_proc_macro
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
+    timeout-minutes: 5
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Set up rust cache
         uses: Swatinem/rust-cache@v2
@@ -176,63 +165,32 @@ jobs:
   simple_proof_regular:
     name: Execute bash script to generate and verify a proof for a small block.
     runs-on: zero-ci
-
+    timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Run the script
-        run: ./scripts/prove_stdio.sh artifacts/witness_b19807080.json
+        run: cargo xtask prove-stdio verify artifacts/witness_b19807080.json
 
   simple_proof_witness_only:
     name: Execute bash script to generate the proof witness for a small block.
     runs-on: zero-ci
-
+    timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Run the script
-        run: ./scripts/prove_stdio.sh artifacts/witness_b19807080.json test_only
+        run: cargo xtask prove-stdio test artifacts/witness_b19807080.json
 
   multi_blocks_proof_regular:
     name: Execute bash script to generate and verify a proof for multiple blocks using parallel proving.
     runs-on: zero-ci
-
+    timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Run the script
-        run: ./scripts/prove_stdio.sh artifacts/witness_b3_b6.json
-
-  lints:
-    name: Rustdoc, Formatting and Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: ${{ ! contains(toJSON(github.event.commits.*.message), '[skip-ci]') }}
-    steps:
-      - name: Checkout sources
         uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      - name: Set up rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Run cargo fmt
-        run: cargo fmt --all --check
-
-      - name: Run cargo clippy
-        run: cargo clippy --all-targets -- -D warnings -A incomplete-features
-
-      - name: Run cargo clippy (with `cdk_erigon` flag)
-        run: cargo clippy --package zero --all-targets --no-default-features --features cdk_erigon -- -D warnings -A incomplete-features
-
-      - name: Rustdoc
-        run: cargo doc --all
+      - name: Run the script
+        run: cargo xtask prove-stdio verify artifacts/witness_b3_b6.json --use-test-config
