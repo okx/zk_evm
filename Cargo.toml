@@ -112,11 +112,11 @@ zk_evm_proc_macro = { path = "proc_macro", version = "0.1.0" }
 zero = { path = "zero", default-features = false }
 
 # plonky2-related dependencies
-plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
-plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
-plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
-starky = { git = "https://github.com/okx/plonky2.git", rev = "8aaefc4768234b93fabfe3ec6435acb87be86d37" }
-zeknox = { git = "https://github.com/okx/zeknox.git", rev = "500ce15c50d31bd48b466e4571cad2c66bacf368" }
+plonky2 = { git = "https://github.com/okx/plonky2.git", rev = "ee6cbfeb1222dba03e8e5723cf3a4981fa39d462" }
+plonky2_maybe_rayon = { git = "https://github.com/okx/plonky2.git", rev = "ee6cbfeb1222dba03e8e5723cf3a4981fa39d462" }
+plonky2_util = { git = "https://github.com/okx/plonky2.git", rev = "ee6cbfeb1222dba03e8e5723cf3a4981fa39d462" }
+starky = { git = "https://github.com/okx/plonky2.git", rev = "ee6cbfeb1222dba03e8e5723cf3a4981fa39d462" }
+zeknox = { git = "https://github.com/okx/zeknox.git", rev = "d458b9f63d2a594f4fabfbce6da5c02294bbdf5a", package="zeknox_p2"}
 
 [workspace.lints.clippy]
 too_long_first_doc_paragraph = "allow"
